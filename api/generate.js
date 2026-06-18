@@ -162,108 +162,128 @@ module.exports = async function handler(req, res) {
 
     // --- SKRIDT 3.5: OFFENTLIG DELING ---
     let secureFileUrl = "";
-    let linkDebugInfo = "OK - Offentligt redigeringslink oprettet";
+    let linkDebugInfo = "OK - Offentligt link oprettet";
 
     if (onlyOfficeFileId !== "ukendt-id") {
 
-      // Forsøg 1: Fil-specifikt share-endpoint med PUT (korrekt DocSpace endpoint)
+      // Hjælpefunktion: udtræk shareLink fra et response-objekt
+      const extractLink = (data) => {
+        if (!data) return "";
+        const r = data.response ?? data;
+        // Direkte på response-objektet
+        if (r?.sharedTo?.shareLink) return r.sharedTo.shareLink;
+        if (r?.shareLink)           return r.shareLink;
+        if (r?.link)                return r.link;
+        if (r?.url)                 return r.url;
+        // Første element i et array
+        const first = Array.isArray(r) ? r[0] : null;
+        if (first?.sharedTo?.shareLink) return first.sharedTo.shareLink;
+        if (first?.shareLink)           return first.shareLink;
+        if (first?.link)                return first.link;
+        return "";
+      };
+
+      // ---
+      // Forsøg 1: POST /api/2.0/files/file/{id}/link
+      // Opretter det primære eksterne link (officielt DocSpace-endpoint).
+      // ---
       try {
-        const shareEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/share`;
-
-        const shareResponse = await axios.put(shareEndpoint, {
-          share: [
-            {
-              shareTo: "00000000-0000-0000-0000-000000000000", // "Everyone" / public
-              access: "Edit"
-            }
-          ],
-          notify: false,
-          sharingMessage: ""
-        }, {
-          headers: {
-            'Authorization': `Bearer ${docSpaceToken}`,
-            'Content-Type': 'application/json'
-          }
-        });
-
-        const resData = shareResponse.data;
-        const entries = resData?.response;
-
-        if (Array.isArray(entries) && entries.length > 0) {
-          secureFileUrl = entries[0]?.sharedTo?.shareLink
-                       || entries[0]?.link
-                       || entries[0]?.shareLink
-                       || "";
+        const createLinkRes = await axios.post(
+          `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`,
+          {},   // tom body — API'et kræver ingen parametre her
+          { headers: { 'Authorization': `Bearer ${docSpaceToken}`, 'Content-Type': 'application/json' } }
+        );
+        secureFileUrl = extractLink(createLinkRes.data);
+        if (secureFileUrl) {
+          linkDebugInfo = "OK - primært eksternt link oprettet via POST /file/:id/link";
         }
+      } catch (e1) {
+        linkDebugInfo = `POST /link fejlede (${e1.response?.status ?? e1.message})`;
+      }
 
-        // Forsøg 2: Hvis PUT ikke returnerede et link, hent eksisterende shares via GET
-        if (!secureFileUrl) {
-          const getSharesResponse = await axios.get(shareEndpoint, {
-            headers: { 'Authorization': `Bearer ${docSpaceToken}` }
-          });
-          const shares = getSharesResponse.data?.response;
-          if (Array.isArray(shares) && shares.length > 0) {
-            secureFileUrl = shares[0]?.sharedTo?.shareLink
-                         || shares[0]?.link
-                         || shares[0]?.shareLink
-                         || "";
-          }
-        }
-
-        if (!secureFileUrl) {
-          linkDebugInfo = "Share oprettet, men intet link i svar: " + JSON.stringify(resData).substring(0, 300);
-        }
-
-      } catch (shareError) {
-
-        // Forsøg 3: DocSpace "external link" endpoint
+      // ---
+      // Forsøg 2: GET /api/2.0/files/file/{id}/link
+      // Henter det primære eksterne link, hvis det allerede eksisterer.
+      // ---
+      if (!secureFileUrl) {
         try {
-          const externalLinkEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/links`;
-
-          const linkResponse = await axios.post(externalLinkEndpoint, {
-            access: 2,          // 2 = Edit
-            linkType: 2,        // 2 = External/public link
-            password: "",
-            expirationDate: null,
-            denyDownload: false
-          }, {
-            headers: {
-              'Authorization': `Bearer ${docSpaceToken}`,
-              'Content-Type': 'application/json'
-            }
-          });
-
-          const linkData = linkResponse.data?.response;
-          secureFileUrl = linkData?.sharedTo?.shareLink
-                       || linkData?.link
-                       || linkData?.shareLink
-                       || linkData?.url
-                       || "";
-
-          if (!secureFileUrl) {
-            linkDebugInfo = "links-endpoint svarede, men intet link: " + JSON.stringify(linkData).substring(0, 300);
+          const getLinkRes = await axios.get(
+            `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`,
+            { headers: { 'Authorization': `Bearer ${docSpaceToken}` } }
+          );
+          secureFileUrl = extractLink(getLinkRes.data);
+          if (secureFileUrl) {
+            linkDebugInfo = "OK - primært eksternt link hentet via GET /file/:id/link";
           }
-
-        } catch (linkError) {
-
-          // Forsøg 4: Byg direkte editor-URL som nødløsning
-          const viewerUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&action=view`;
-          secureFileUrl = viewerUrl;
-          linkDebugInfo = `Brugte direkte editor-URL som nødløsning. Share-fejl: ${shareError.message}. Links-fejl: ${linkError.message}`;
+        } catch (e2) {
+          linkDebugInfo += ` | GET /link fejlede (${e2.response?.status ?? e2.message})`;
         }
       }
+
+      // ---
+      // Forsøg 3: PUT /api/2.0/files/file/{id}/links
+      // Sætter et eksternt link med adgangsniveau (det officielle "Set an external link"-endpoint).
+      // ---
+      if (!secureFileUrl) {
+        try {
+          const putLinksRes = await axios.put(
+            `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/links`,
+            { access: 2, linkType: 2, denyDownload: false },
+            { headers: { 'Authorization': `Bearer ${docSpaceToken}`, 'Content-Type': 'application/json' } }
+          );
+          secureFileUrl = extractLink(putLinksRes.data);
+          if (secureFileUrl) {
+            linkDebugInfo = "OK - eksternt link oprettet via PUT /file/:id/links";
+          } else {
+            linkDebugInfo += ` | PUT /links svarede 200 men uden link: ${JSON.stringify(putLinksRes.data).substring(0, 200)}`;
+          }
+        } catch (e3) {
+          linkDebugInfo += ` | PUT /links fejlede (${e3.response?.status ?? e3.message})`;
+        }
+      }
+
+      // ---
+      // Forsøg 4: GET /api/2.0/files/file/{id}/links
+      // Henter alle eksisterende eksterne links på filen.
+      // ---
+      if (!secureFileUrl) {
+        try {
+          const getLinksRes = await axios.get(
+            `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/links`,
+            { headers: { 'Authorization': `Bearer ${docSpaceToken}` } }
+          );
+          secureFileUrl = extractLink(getLinksRes.data);
+          if (secureFileUrl) {
+            linkDebugInfo = "OK - eksternt link hentet via GET /file/:id/links";
+          } else {
+            linkDebugInfo += ` | GET /links svarede uden link: ${JSON.stringify(getLinksRes.data).substring(0, 200)}`;
+          }
+        } catch (e4) {
+          linkDebugInfo += ` | GET /links fejlede (${e4.response?.status ?? e4.message})`;
+        }
+      }
+
+      // ---
+      // Forsøg 5: Byg direkte editor-URL som absolut nødløsning
+      // ---
+      if (!secureFileUrl) {
+        secureFileUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&action=view`;
+        linkDebugInfo += " | Brugte direkte editor-URL som nødløsning";
+      }
+
     } else {
       linkDebugInfo = "Kunne ikke oprette link: Fandt ikke et gyldigt fileId i upload-svaret.";
     }
 
-    // Hvis alt fejler, giv fallback web-url så systemet ikke crasher
-    if (!secureFileUrl && fallbackWebUrl) {
-      secureFileUrl = fallbackWebUrl;
-      linkDebugInfo += " -> Brugte intern fallback URL.";
-    }
-
+    // Sikr at relative URL'er bliver absolutte
     if (secureFileUrl && secureFileUrl.startsWith('/')) {
       secureFileUrl = baseUrl + secureFileUrl;
+    }
+
+    // Fallback til intern webUrl fra upload-svaret, hvis alt andet er tomt
+    if (!secureFileUrl && fallbackWebUrl) {
+      secureFileUrl = fallbackWebUrl;
+      linkDebugInfo += " -> Brugte intern fallback URL fra upload-svar.";
     }
 
     // --- SKRIDT 4: OPRYDNING & SVAR ---
