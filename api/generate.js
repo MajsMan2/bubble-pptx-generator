@@ -52,12 +52,12 @@ module.exports = async function handler(req, res) {
     // --- SKRIDT 2: FLET POWERPOINT ---
     if (Automizer && modify) {
       try {
-        const automizer = new Automizer({ 
-          templateDir: '/tmp', 
+        const automizer = new Automizer({
+          templateDir: '/tmp',
           outputDir: '/tmp',
-          removeExistingSlides: true 
+          removeExistingSlides: true
         });
-        
+
         const templateFilename = path.basename(templatePath);
         let pres = automizer.loadRoot(templateFilename);
         pres.load(templateFilename, 'base');
@@ -76,7 +76,7 @@ module.exports = async function handler(req, res) {
         for (const slide of slides) {
           pres.addSlide('base', slide.number, async (s) => {
             const textElements = await s.getAllTextElementIds();
-            
+
             let tableElements = [];
             try {
               if (typeof s.getAllElements === 'function') {
@@ -119,7 +119,7 @@ module.exports = async function handler(req, res) {
     if (baseUrl.endsWith('/api/2.0')) {
       baseUrl = baseUrl.replace('/api/2.0', '');
     }
-    
+
     uploadUrl = `${baseUrl}/api/2.0/files/${folderId}/upload`;
 
     const form = new FormData();
@@ -145,7 +145,7 @@ module.exports = async function handler(req, res) {
     const ooData = onlyOfficeResponse.data;
     let onlyOfficeFileId = "ukendt-id";
     let fallbackWebUrl = "";
-    
+
     if (ooData) {
       if (ooData.id) onlyOfficeFileId = ooData.id;
       else if (ooData.response?.id) onlyOfficeFileId = ooData.response.id;
@@ -160,54 +160,103 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // --- SKRIDT 3.5: OFFENTLIG DELING VIA UNIVERSAL ENDPOINT ---
+    // --- SKRIDT 3.5: OFFENTLIG DELING ---
     let secureFileUrl = "";
     let linkDebugInfo = "OK - Offentligt redigeringslink oprettet";
 
     if (onlyOfficeFileId !== "ukendt-id") {
+
+      // Forsøg 1: Fil-specifikt share-endpoint med PUT (korrekt DocSpace endpoint)
       try {
-        // Universelt DocSpace share-endpoint
-        const shareEndpoint = `${baseUrl}/api/2.0/files/share`;
-        
-        const shareResponse = await axios.post(shareEndpoint, {
-          fileId: Number(onlyOfficeFileId), // Sender id'et med i JSON body
-          shareType: 1,                    // 1 = Offentligt link (Public link)
-          access: 2                        // 2 = Redigeringsadgang (Edit)
+        const shareEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/share`;
+
+        const shareResponse = await axios.put(shareEndpoint, {
+          share: [
+            {
+              shareTo: "00000000-0000-0000-0000-000000000000", // "Everyone" / public
+              access: "Edit"
+            }
+          ],
+          notify: false,
+          sharingMessage: ""
         }, {
           headers: {
             'Authorization': `Bearer ${docSpaceToken}`,
             'Content-Type': 'application/json'
           }
         });
-        
+
         const resData = shareResponse.data;
-        secureFileUrl = resData?.response?.link || 
-                        resData?.response?.shareLink || 
-                        resData?.link || 
-                        resData?.shareLink || "";
-                        
-        if (!secureFileUrl) {
-          linkDebugInfo = "API svarede 200, men manglede URL i JSON: " + JSON.stringify(resData);
+        const entries = resData?.response;
+
+        if (Array.isArray(entries) && entries.length > 0) {
+          secureFileUrl = entries[0]?.sharedTo?.shareLink
+                       || entries[0]?.link
+                       || entries[0]?.shareLink
+                       || "";
         }
-      } catch (linkError) {
-        // Hvis universelt fejler, prøver vi det sekundære "invitation" link-endpoint
-        try {
-          const fallbackEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/shares`;
-          const altResponse = await axios.post(fallbackEndpoint, {
-            share: { shareType: 1, access: 2 }
-          }, {
-            headers: { 'Authorization': `Bearer ${docSpaceToken}`, 'Content-Type': 'application/json' }
+
+        // Forsøg 2: Hvis PUT ikke returnerede et link, hent eksisterende shares via GET
+        if (!secureFileUrl) {
+          const getSharesResponse = await axios.get(shareEndpoint, {
+            headers: { 'Authorization': `Bearer ${docSpaceToken}` }
           });
-          secureFileUrl = altResponse.data?.response?.link || altResponse.data?.link || "";
-        } catch (altError) {
-          linkDebugInfo = `404 afhjulpet, men ny fejl opstod. Besked: ${linkError.message}. Detaljer: ` + JSON.stringify(linkError.response?.data || {});
+          const shares = getSharesResponse.data?.response;
+          if (Array.isArray(shares) && shares.length > 0) {
+            secureFileUrl = shares[0]?.sharedTo?.shareLink
+                         || shares[0]?.link
+                         || shares[0]?.shareLink
+                         || "";
+          }
+        }
+
+        if (!secureFileUrl) {
+          linkDebugInfo = "Share oprettet, men intet link i svar: " + JSON.stringify(resData).substring(0, 300);
+        }
+
+      } catch (shareError) {
+
+        // Forsøg 3: DocSpace "external link" endpoint
+        try {
+          const externalLinkEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/links`;
+
+          const linkResponse = await axios.post(externalLinkEndpoint, {
+            access: 2,          // 2 = Edit
+            linkType: 2,        // 2 = External/public link
+            password: "",
+            expirationDate: null,
+            denyDownload: false
+          }, {
+            headers: {
+              'Authorization': `Bearer ${docSpaceToken}`,
+              'Content-Type': 'application/json'
+            }
+          });
+
+          const linkData = linkResponse.data?.response;
+          secureFileUrl = linkData?.sharedTo?.shareLink
+                       || linkData?.link
+                       || linkData?.shareLink
+                       || linkData?.url
+                       || "";
+
+          if (!secureFileUrl) {
+            linkDebugInfo = "links-endpoint svarede, men intet link: " + JSON.stringify(linkData).substring(0, 300);
+          }
+
+        } catch (linkError) {
+
+          // Forsøg 4: Byg direkte editor-URL som nødløsning
+          const viewerUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&action=view`;
+          secureFileUrl = viewerUrl;
+          linkDebugInfo = `Brugte direkte editor-URL som nødløsning. Share-fejl: ${shareError.message}. Links-fejl: ${linkError.message}`;
         }
       }
     } else {
       linkDebugInfo = "Kunne ikke oprette link: Fandt ikke et gyldigt fileId i upload-svaret.";
     }
 
-    // Hvis alt fejler, giv dem i det mindste fallback web-url'en så systemet ikke crasher
+    // Hvis alt fejler, giv fallback web-url så systemet ikke crasher
     if (!secureFileUrl && fallbackWebUrl) {
       secureFileUrl = fallbackWebUrl;
       linkDebugInfo += " -> Brugte intern fallback URL.";
