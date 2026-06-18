@@ -6,7 +6,7 @@
     "start": "node api/generate.js"
   },
   "dependencies": {
-    "pptx-automizer": "^1.0.0",
+    "pptx-automizer": "latest",
     "axios": "^1.6.0"
   }
 }
