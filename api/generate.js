@@ -49,7 +49,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --- SKRIDT 2: FLET POWERPOINT (PLACEHOLDERS) ---
+    // --- SKRIDT 2: FLET POWERPOINT (PLACEHOLDERS I TEKST & TABELLER) ---
     if (Automizer && modify) {
       try {
         const automizer = new Automizer({ 
@@ -65,6 +65,7 @@ module.exports = async function handler(req, res) {
         const info = await pres.getInfo();
         const slides = info.slidesByTemplate('base');
 
+        // Gør erstatnings-parametrene klar (både rå tekst og {{tekst}})
         const replaceParams = [];
         for (const [key, value] of Object.entries(placeholders)) {
           replaceParams.push({ replace: key, by: { text: String(value) } });
@@ -75,8 +76,27 @@ module.exports = async function handler(req, res) {
 
         for (const slide of slides) {
           pres.addSlide('base', slide.number, async (s) => {
-            const elements = await s.getAllTextElementIds();
-            for (const element of elements) {
+            // 1. Hent alle almindelige tekst-elementer
+            const textElements = await s.getAllTextElementIds();
+            
+            // 2. Hent alle tabel-elementer (så vi kan ramme placeholders inde i tabeller)
+            let tableElements = [];
+            try {
+              if (typeof s.getAllElements === 'function') {
+                const allElements = await s.getAllElements();
+                tableElements = allElements
+                  .filter(el => el && el.type === 'table' && el.name)
+                  .map(el => el.name);
+              }
+            } catch (tableError) {
+              console.error("Kunne ikke scanne efter tabeller på slide " + slide.number, tableError);
+            }
+
+            // 3. Kombiner tekstbokse og tabeller til én samlet liste uden dubletter
+            const combinedElements = Array.from(new Set([...textElements, ...tableElements]));
+
+            // 4. Kør Søg & Erstat på alle fundne elementer
+            for (const element of combinedElements) {
               s.modifyElement(element, shapeModCb);
             }
           });
@@ -126,9 +146,10 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --- FIND DET RIGTIGE FILE ID ---
+    // --- SKRIDT 3.2: FIND FILE ID & FALLBACK URL ---
     const ooData = onlyOfficeResponse.data;
     let onlyOfficeFileId = "ukendt-id";
+    let fallbackWebUrl = "";
     
     if (ooData) {
       if (ooData.id) onlyOfficeFileId = ooData.id;
@@ -137,10 +158,17 @@ module.exports = async function handler(req, res) {
       else if (Array.isArray(ooData.response) && ooData.response[0]?.id) onlyOfficeFileId = ooData.response[0].id;
       else if (Array.isArray(ooData.response) && ooData.response[0]?.Id) onlyOfficeFileId = ooData.response[0].Id;
       else if (ooData.response?.file?.id) onlyOfficeFileId = ooData.response.file.id;
+
+      const fileObj = ooData.response?.file || (Array.isArray(ooData.response) ? ooData.response[0] : ooData.response);
+      if (fileObj) {
+        fallbackWebUrl = fileObj.webUrl || fileObj.WebUrl || fileObj.viewUrl || fileObj.ViewUrl || "";
+      }
     }
 
-    // --- SKRIDT 3.5: GENERER ISOLERET EKSTERNT DELINGSLINK ---
+    // --- SKRIDT 3.5: GENERER DELINGSLINK ---
     let secureFileUrl = "";
+    let linkDebugInfo = "OK - Link oprettet succesfuldt via API";
+
     if (onlyOfficeFileId !== "ukendt-id") {
       try {
         const linkEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`;
@@ -150,11 +178,30 @@ module.exports = async function handler(req, res) {
             'Content-Type': 'application/json'
           }
         });
-        // Gemmer det direkte standalone-link fra API-svaret
-        secureFileUrl = linkResponse.data?.response?.shareLink || linkResponse.data?.response || "";
+        
+        const resData = linkResponse.data;
+        secureFileUrl = resData?.response?.shareLink || 
+                        resData?.response?.link || 
+                        resData?.shareLink || 
+                        resData?.link || "";
+                        
+        if (!secureFileUrl) {
+          linkDebugInfo = "API svarede 200, men kunne ikke matche JSON-stien. Svar-data: " + JSON.stringify(resData);
+        }
       } catch (linkError) {
-        console.error("Kunne ikke generere delingslink:", linkError.message);
+        linkDebugInfo = "Fejl på /link endpoint: " + linkError.message + 
+                        (linkError.response?.data ? " - API svar: " + JSON.stringify(linkError.response.data) : "");
       }
+    } else {
+      linkDebugInfo = "Kunne ikke kalde /link, da fileId ikke blev fundet i upload-svaret.";
+    }
+
+    if (!secureFileUrl && fallbackWebUrl) {
+      secureFileUrl = fallbackWebUrl;
+    }
+
+    if (secureFileUrl && secureFileUrl.startsWith('/')) {
+      secureFileUrl = baseUrl + secureFileUrl;
     }
 
     // --- SKRIDT 4: OPRYDNING & SVAR ---
@@ -164,7 +211,8 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({
       success: true,
       fileId: String(onlyOfficeFileId),
-      fileUrl: secureFileUrl // <--- DETTE LINK SENDES NU RETUR TIL BUBBLE!
+      fileUrl: secureFileUrl,
+      debugInfo: linkDebugInfo
     });
 
   } catch (globalError) {
