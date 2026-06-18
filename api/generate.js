@@ -13,13 +13,23 @@ try {
   console.error("Kunne ikke loade pptx-automizer:", e);
 }
 
+// Genererer 4 tilfældige alfanumeriske tegn, fx "f3r5"
+function randomId() {
+  return Math.random().toString(36).substring(2, 6);
+}
+
+// Renser firmanavn så det er sikkert at bruge i et filnavn
+function safeFilename(name) {
+  return String(name).replace(/[^a-zA-Z0-9æøåÆØÅ\-_]/g, '_').substring(0, 60);
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
   let templatePath = path.join('/tmp', `template_${Date.now()}.pptx`);
-  let outputPath = path.join('/tmp', `output_${Date.now()}.pptx`);
+  let outputPath;
 
   try {
     let body = req.body;
@@ -27,10 +37,17 @@ module.exports = async function handler(req, res) {
       body = JSON.parse(body);
     }
 
-    const { template_url, placeholders } = body;
+    const { template_url, placeholders, company_unique_id, company_name } = body;
+
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
     }
+
+    // Byg filnavn: 4 tilfældige tegn + firmanavn, fx "f3r5_TestCompany.pptx"
+    const filePrefix = company_name
+      ? `${randomId()}_${safeFilename(company_name)}`
+      : `${randomId()}_rapport`;
+    outputPath = path.join('/tmp', `${filePrefix}.pptx`);
 
     // --- SKRIDT 1: DOWNLOAD SKABELON ---
     let finalUrl = template_url.trim();
@@ -119,7 +136,7 @@ module.exports = async function handler(req, res) {
     }
 
     const form = new FormData();
-    form.append('file', fs.createReadStream(outputPath));
+    form.append('file', fs.createReadStream(outputPath), path.basename(outputPath));
 
     let onlyOfficeResponse;
     try {
@@ -158,13 +175,11 @@ module.exports = async function handler(req, res) {
     let shareToken = "";
     let linkDebugInfo = "";
 
-    // Hjælpefunktion: udtræk shareLink/token fra et svar-objekt
     const extractShareToken = (data) => {
       if (!data) return "";
       const r = data.response ?? data;
       const candidates = [r, ...(Array.isArray(r) ? r : [])];
       for (const c of candidates) {
-        // shareLink er typisk på formen: https://docspace.../s/TOKEN
         const raw = c?.sharedTo?.shareLink || c?.shareLink || c?.link || c?.url || "";
         if (raw) return raw;
       }
@@ -177,7 +192,7 @@ module.exports = async function handler(req, res) {
       try {
         const r = await axios.post(
           `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`,
-          { access: 2 },   // 2 = Edit
+          { access: 2 },
           { headers: { 'Authorization': `Bearer ${docSpaceToken}`, 'Content-Type': 'application/json' } }
         );
         shareToken = extractShareToken(r.data);
@@ -188,7 +203,7 @@ module.exports = async function handler(req, res) {
         linkDebugInfo = `POST /link fejl (${e1.response?.status ?? e1.message})`;
       }
 
-      // Forsøg 2: GET /api/2.0/files/file/{id}/link  (hent eksisterende primært link)
+      // Forsøg 2: GET /api/2.0/files/file/{id}/link
       if (!shareToken) {
         try {
           const r = await axios.get(
@@ -204,7 +219,7 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Forsøg 3: PUT /api/2.0/files/file/{id}/links  (Set external link, Edit-adgang)
+      // Forsøg 3: PUT /api/2.0/files/file/{id}/links
       if (!shareToken) {
         try {
           const r = await axios.put(
@@ -221,7 +236,7 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Forsøg 4: GET /api/2.0/files/file/{id}/links  (hent alle eksterne links)
+      // Forsøg 4: GET /api/2.0/files/file/{id}/links
       if (!shareToken) {
         try {
           const r = await axios.get(
@@ -239,26 +254,18 @@ module.exports = async function handler(req, res) {
     }
 
     // --- SKRIDT 3.6: BYGG EDITOR-URL ---
-    // DocSpace's doceditor-URL åbner filen direkte i den fulde editor uden login,
-    // når der medfølger et gyldigt share-token. Uden token virker den kun for
-    // brugere der er logget ind, men er stadig bedre end ingenting.
     let editorUrl = "";
 
     if (shareToken) {
-      // Uddrag token-delen fra shareLink (typisk: https://host/s/XXXTOKEN)
       const tokenMatch = shareToken.match(/\/s\/([^/?#]+)/);
       const token = tokenMatch ? tokenMatch[1] : "";
 
-      if (token) {
-        // Åbner direkte i editoren med share-token — ingen login krævet
-        editorUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&share=${token}&action=edit&type=desktop`;
-      } else {
-        // shareLink var en fuld URL men uden /s/-mønster — brug den direkte
-        editorUrl = shareToken;
-      }
+      editorUrl = token
+        ? `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&share=${token}&action=edit&type=desktop`
+        : shareToken;
+
       linkDebugInfo = `OK (${linkDebugInfo.trim()})`;
     } else {
-      // Ingen share-token fundet — byg URL der kræver login
       editorUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&action=edit&type=desktop`;
       linkDebugInfo = `Ingen share-token — editor-URL kræver login. Debug: ${linkDebugInfo}`;
     }
@@ -269,9 +276,11 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json({
       success: true,
+      company_unique_id: company_unique_id ?? null,
       fileId: String(onlyOfficeFileId),
-      fileUrl: editorUrl,       // Direkte editor-link klar til at sende til brugeren
-      shareLink: shareToken,    // Råt share-link fra DocSpace (hvis tilgængeligt)
+      fileName: path.basename(outputPath),
+      fileUrl: editorUrl,
+      shareLink: shareToken,
       debugInfo: linkDebugInfo
     });
 
