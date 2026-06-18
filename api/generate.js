@@ -49,7 +49,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --- SKRIDT 2: FLET POWERPOINT (PLACEHOLDERS I TEKST & TABELLER) ---
+    // --- SKRIDT 2: FLET POWERPOINT ---
     if (Automizer && modify) {
       try {
         const automizer = new Automizer({ 
@@ -65,7 +65,6 @@ module.exports = async function handler(req, res) {
         const info = await pres.getInfo();
         const slides = info.slidesByTemplate('base');
 
-        // Gør erstatnings-parametrene klar (både rå tekst og {{tekst}})
         const replaceParams = [];
         for (const [key, value] of Object.entries(placeholders)) {
           replaceParams.push({ replace: key, by: { text: String(value) } });
@@ -76,10 +75,8 @@ module.exports = async function handler(req, res) {
 
         for (const slide of slides) {
           pres.addSlide('base', slide.number, async (s) => {
-            // 1. Hent alle almindelige tekst-elementer
             const textElements = await s.getAllTextElementIds();
             
-            // 2. Hent alle tabel-elementer (så vi kan ramme placeholders inde i tabeller)
             let tableElements = [];
             try {
               if (typeof s.getAllElements === 'function') {
@@ -92,10 +89,8 @@ module.exports = async function handler(req, res) {
               console.error("Kunne ikke scanne efter tabeller på slide " + slide.number, tableError);
             }
 
-            // 3. Kombiner tekstbokse og tabeller til én samlet liste uden dubletter
             const combinedElements = Array.from(new Set([...textElements, ...tableElements]));
 
-            // 4. Kør Søg & Erstat på alle fundne elementer
             for (const element of combinedElements) {
               s.modifyElement(element, shapeModCb);
             }
@@ -146,7 +141,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --- SKRIDT 3.2: FIND FILE ID & FALLBACK URL ---
+    // --- SKRIDT 3.2: FIND FILE ID & FALLBACK ---
     const ooData = onlyOfficeResponse.data;
     let onlyOfficeFileId = "ukendt-id";
     let fallbackWebUrl = "";
@@ -165,35 +160,41 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // --- SKRIDT 3.5: GENERER DELINGSLINK ---
+    // --- SKRIDT 3.5: GENERER OFFENTLIGT DELINGSLINK (UDEN LOGIN) ---
     let secureFileUrl = "";
-    let linkDebugInfo = "OK - Link oprettet succesfuldt via API";
+    let linkDebugInfo = "OK - Offentligt redigeringslink oprettet succesfuldt via API";
 
     if (onlyOfficeFileId !== "ukendt-id") {
       try {
-        const linkEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`;
-        const linkResponse = await axios.post(linkEndpoint, {}, {
+        // Vi kalder share/file/{id} i stedet for file/{id}/link for at lave et ægte eksternt adgangslink
+        const shareEndpoint = `${baseUrl}/api/2.0/files/share/file/${onlyOfficeFileId}`;
+        
+        const shareResponse = await axios.post(shareEndpoint, {
+          shareType: 1,  // 1 = Public / Offentlig deling via link
+          access: 2      // 2 = Editing / Fuld redigeringsadgang (Brug 3 hvis det kun skal være Read-only)
+        }, {
           headers: {
             'Authorization': `Bearer ${docSpaceToken}`,
             'Content-Type': 'application/json'
           }
         });
         
-        const resData = linkResponse.data;
-        secureFileUrl = resData?.response?.shareLink || 
-                        resData?.response?.link || 
-                        resData?.shareLink || 
-                        resData?.link || "";
+        const resData = shareResponse.data;
+        // ONLYOFFICE DocSpace returnerer typisk det offentlige link under response.link eller response.shareLink
+        secureFileUrl = resData?.response?.link || 
+                        resData?.response?.shareLink || 
+                        resData?.link || 
+                        resData?.shareLink || "";
                         
         if (!secureFileUrl) {
-          linkDebugInfo = "API svarede 200, men kunne ikke matche JSON-stien. Svar-data: " + JSON.stringify(resData);
+          linkDebugInfo = "API godkendte deling, men svarede med en uventet JSON struktur: " + JSON.stringify(resData);
         }
       } catch (linkError) {
-        linkDebugInfo = "Fejl på /link endpoint: " + linkError.message + 
+        linkDebugInfo = "Fejl ved oprettelse af offentligt link: " + linkError.message + 
                         (linkError.response?.data ? " - API svar: " + JSON.stringify(linkError.response.data) : "");
       }
     } else {
-      linkDebugInfo = "Kunne ikke kalde /link, da fileId ikke blev fundet i upload-svaret.";
+      linkDebugInfo = "Kunne ikke kalde share endpointet, da fileId ikke blev fundet i upload-svaret.";
     }
 
     if (!secureFileUrl && fallbackWebUrl) {
