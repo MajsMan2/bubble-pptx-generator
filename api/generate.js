@@ -3,7 +3,6 @@ const fs = require('fs');
 const path = require('path');
 const FormData = require('form-data');
 
-// Sikker indlæsning af pptx-automizer
 let Automizer;
 try {
   const mod = require('pptx-automizer');
@@ -13,80 +12,113 @@ try {
 }
 
 module.exports = async function handler(req, res) {
-  // Tillad kun POST-kald
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  try {
-    const { template_url, placeholders } = req.body;
+  let templatePath = path.join('/tmp', `template_${Date.now()}.pptx`);
+  let outputPath = path.join('/tmp', `output_${Date.now()}.pptx`);
+  let uploadUrl = ""; // Defineres globalt så den kan bruges i fejlhåndtering
 
-    if (!template_url || !placeholders) {
-      return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON payload' });
+  try {
+    let body = req.body;
+    if (typeof body === 'string') {
+      body = JSON.parse(body);
     }
 
-    // 1. Download PPTX skabelonen til en midlertidig mappe (/tmp)
-    const templateResponse = await axios.get(template_url, { responseType: 'arraybuffer' });
-    const templatePath = path.join('/tmp', `template_${Date.now()}.pptx`);
-    fs.writeFileSync(templatePath, Buffer.from(templateResponse.data));
+    const { template_url, placeholders } = body;
+    if (!template_url || !placeholders) {
+      return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
+    }
 
-    const outputPath = path.join('/tmp', `output_${Date.now()}.pptx`);
+    // --- SKRIDT 1: DOWNLOAD SKABELON ---
+    let finalUrl = template_url.trim();
+    if (finalUrl.startsWith('//')) {
+      finalUrl = 'https:' + finalUrl;
+    }
 
-    // 2. Kør fletning via pptx-automizer
-    if (Automizer) {
-      const automizer = new Automizer({
-        templateDir: '/tmp',
-        outputDir: '/tmp'
+    try {
+      const templateResponse = await axios.get(finalUrl, { responseType: 'arraybuffer' });
+      fs.writeFileSync(templatePath, Buffer.from(templateResponse.data));
+    } catch (downloadError) {
+      return res.status(500).json({
+        error: 'Fejl under download af din PPTX skabelon fra Vercel/GitHub',
+        message: downloadError.message
       });
+    }
 
-      const filename = path.basename(templatePath);
-      let pres = automizer.loadRoot(filename);
-      
-      // Her gemmer vi den foreløbige flettede fil ud til output-stien
-      await pres.write(path.basename(outputPath));
+    // --- SKRIDT 2: FLET POWERPOINT ---
+    if (Automizer) {
+      try {
+        const automizer = new Automizer({ templateDir: '/tmp', outputDir: '/tmp' });
+        let pres = automizer.loadRoot(path.basename(templatePath));
+        await pres.write(path.basename(outputPath));
+      } catch (fletFejl) {
+        fs.copyFileSync(templatePath, outputPath);
+      }
     } else {
-      // Nødløsning hvis biblioteket fejler: Lav en direkte kopi af skabelonen
       fs.copyFileSync(templatePath, outputPath);
     }
 
-    // 3. Hent DocSpace login-oplysninger fra dine Vercel Environment Variables
+    // --- SKRIDT 3: UPLOAD TIL ONLYOFFICE ---
     const docSpaceUrl = process.env.DOCSPACE_URL;
     const docSpaceToken = process.env.DOCSPACE_TOKEN;
+    const folderId = process.env.DOCSPACE_FOLDER_ID;
 
-    if (!docSpaceUrl || !docSpaceToken) {
-      return res.status(500).json({ error: 'Mangler DOCSPACE_URL eller DOCSPACE_TOKEN i Vercel-indstillingerne.' });
+    if (!docSpaceUrl || !docSpaceToken || !folderId) {
+      return res.status(500).json({ error: 'Vercel mangler DOCSPACE_URL, DOCSPACE_TOKEN eller DOCSPACE_FOLDER_ID i indstillingerne.' });
     }
 
-    // 4. Gør filen klar og send den til ONLYOFFICE DocSpace API
+    // SIKKERHEDS-RENSNING AF URL:
+    let baseUrl = docSpaceUrl.trim().replace(/\/$/, '');
+    // Hvis du er kommet til at skrive /api/2.0 i din Vercel variabel, fjerner vi det her for at undgå dubletter
+    if (baseUrl.endsWith('/api/2.0')) {
+      baseUrl = baseUrl.replace('/api/2.0', '');
+    }
+    
+    // Vi stykker den officielle upload-URL sammen
+    uploadUrl = `${baseUrl}/api/2.0/files/${folderId}/upload`;
+
     const form = new FormData();
     form.append('file', fs.createReadStream(outputPath));
 
-    const onlyOfficeResponse = await axios.post(`${docSpaceUrl}/api/2.0/files/upload`, form, {
-      headers: {
-        'Authorization': `Bearer ${docSpaceToken}`,
-        ...form.getHeaders() // Dette tilføjer automatisk de korrekte multipart-headers
-      }
-    });
+    let onlyOfficeResponse;
+    try {
+      onlyOfficeResponse = await axios.post(uploadUrl, form, {
+        headers: {
+          'Authorization': `Bearer ${docSpaceToken}`,
+          ...form.getHeaders()
+        }
+      });
+    } catch (uploadError) {
+      // Her sender vi den præcise URL med ud i Bubble, så vi kan se fejlen sort på hvidt
+      return res.status(500).json({
+        error: 'Fejl under upload til ONLYOFFICE DocSpace API',
+        message: uploadError.message,
+        status: uploadError.response?.status,
+        details: {
+          URL_vi_proevede_at_ramme: uploadUrl,
+          onlyOfficeSvar: uploadError.response?.data || "Ingen data sendt retur fra ONLYOFFICE"
+        }
+      });
+    }
 
-    // 5. Oprydning: Slet de midlertidige filer på Vercel-serveren
+    // --- SKRIDT 4: OPRYDNING & SVAR ---
     if (fs.existsSync(templatePath)) fs.unlinkSync(templatePath);
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
 
-    // Hent det nye fileId ud fra ONLYOFFICE's svar
     const onlyOfficeFileId = onlyOfficeResponse.data?.response?.id || "ukendt-id";
 
-    // Send succes-status og ID tilbage til Bubble synkront
     return res.status(200).json({
       success: true,
       fileId: onlyOfficeFileId
     });
 
-  } catch (error) {
-    console.error("Fejl under generering:", error);
+  } catch (globalError) {
     return res.status(500).json({
-      error: 'Der skete en fejl i din generation-backend',
-      message: error.message,
-      details: error.response?.data || null
+      error: 'Uventet global fejl i backenden',
+      message: globalError.message,
+      details: { URL_under_fejl: uploadUrl }
     });
   }
 };
