@@ -4,9 +4,11 @@ const path = require('path');
 const FormData = require('form-data');
 
 let Automizer;
+let modify;
 try {
   const mod = require('pptx-automizer');
   Automizer = mod.default || mod;
+  modify = mod.modify;
 } catch (e) {
   console.error("Kunne ikke loade pptx-automizer:", e);
 }
@@ -18,7 +20,7 @@ module.exports = async function handler(req, res) {
 
   let templatePath = path.join('/tmp', `template_${Date.now()}.pptx`);
   let outputPath = path.join('/tmp', `output_${Date.now()}.pptx`);
-  let uploadUrl = ""; // Defineres globalt så den kan bruges i fejlhåndtering
+  let uploadUrl = "";
 
   try {
     let body = req.body;
@@ -47,13 +49,42 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --- SKRIDT 2: FLET POWERPOINT ---
-    if (Automizer) {
+    // --- SKRIDT 2: FLET POWERPOINT (PLACEHOLDERS) ---
+    if (Automizer && modify) {
       try {
-        const automizer = new Automizer({ templateDir: '/tmp', outputDir: '/tmp' });
-        let pres = automizer.loadRoot(path.basename(templatePath));
+        const automizer = new Automizer({ 
+          templateDir: '/tmp', 
+          outputDir: '/tmp',
+          removeExistingSlides: true 
+        });
+        
+        const templateFilename = path.basename(templatePath);
+        let pres = automizer.loadRoot(templateFilename);
+        pres.load(templateFilename, 'base');
+
+        const info = await pres.getInfo();
+        const slides = info.slidesByTemplate('base');
+
+        const replaceParams = [];
+        for (const [key, value] of Object.entries(placeholders)) {
+          replaceParams.push({ replace: key, by: { text: String(value) } });
+          replaceParams.push({ replace: `{{${key}}}`, by: { text: String(value) } });
+        }
+
+        const shapeModCb = modify.replaceText(replaceParams);
+
+        for (const slide of slides) {
+          pres.addSlide('base', slide.number, async (s) => {
+            const elements = await s.getAllTextElementIds();
+            for (const element of elements) {
+              s.modifyElement(element, shapeModCb);
+            }
+          });
+        }
+
         await pres.write(path.basename(outputPath));
       } catch (fletFejl) {
+        console.error("Fletfejl, sender rå skabelon videre:", fletFejl);
         fs.copyFileSync(templatePath, outputPath);
       }
     } else {
@@ -69,14 +100,11 @@ module.exports = async function handler(req, res) {
       return res.status(500).json({ error: 'Vercel mangler DOCSPACE_URL, DOCSPACE_TOKEN eller DOCSPACE_FOLDER_ID i indstillingerne.' });
     }
 
-    // SIKKERHEDS-RENSNING AF URL:
     let baseUrl = docSpaceUrl.trim().replace(/\/$/, '');
-    // Hvis du er kommet til at skrive /api/2.0 i din Vercel variabel, fjerner vi det her for at undgå dubletter
     if (baseUrl.endsWith('/api/2.0')) {
       baseUrl = baseUrl.replace('/api/2.0', '');
     }
     
-    // Vi stykker den officielle upload-URL sammen
     uploadUrl = `${baseUrl}/api/2.0/files/${folderId}/upload`;
 
     const form = new FormData();
@@ -91,34 +119,58 @@ module.exports = async function handler(req, res) {
         }
       });
     } catch (uploadError) {
-      // Her sender vi den præcise URL med ud i Bubble, så vi kan se fejlen sort på hvidt
       return res.status(500).json({
         error: 'Fejl under upload til ONLYOFFICE DocSpace API',
         message: uploadError.message,
-        status: uploadError.response?.status,
-        details: {
-          URL_vi_proevede_at_ramme: uploadUrl,
-          onlyOfficeSvar: uploadError.response?.data || "Ingen data sendt retur fra ONLYOFFICE"
-        }
+        details: uploadError.response?.data
       });
+    }
+
+    // --- FIND DET RIGTIGE FILE ID ---
+    const ooData = onlyOfficeResponse.data;
+    let onlyOfficeFileId = "ukendt-id";
+    
+    if (ooData) {
+      if (ooData.id) onlyOfficeFileId = ooData.id;
+      else if (ooData.response?.id) onlyOfficeFileId = ooData.response.id;
+      else if (ooData.response?.Id) onlyOfficeFileId = ooData.response.Id;
+      else if (Array.isArray(ooData.response) && ooData.response[0]?.id) onlyOfficeFileId = ooData.response[0].id;
+      else if (Array.isArray(ooData.response) && ooData.response[0]?.Id) onlyOfficeFileId = ooData.response[0].Id;
+      else if (ooData.response?.file?.id) onlyOfficeFileId = ooData.response.file.id;
+    }
+
+    // --- SKRIDT 3.5: GENERER ISOLERET EKSTERNT DELINGSLINK ---
+    let secureFileUrl = "";
+    if (onlyOfficeFileId !== "ukendt-id") {
+      try {
+        const linkEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`;
+        const linkResponse = await axios.post(linkEndpoint, {}, {
+          headers: {
+            'Authorization': `Bearer ${docSpaceToken}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        // Gemmer det direkte standalone-link fra API-svaret
+        secureFileUrl = linkResponse.data?.response?.shareLink || linkResponse.data?.response || "";
+      } catch (linkError) {
+        console.error("Kunne ikke generere delingslink:", linkError.message);
+      }
     }
 
     // --- SKRIDT 4: OPRYDNING & SVAR ---
     if (fs.existsSync(templatePath)) fs.unlinkSync(templatePath);
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
 
-    const onlyOfficeFileId = onlyOfficeResponse.data?.response?.id || "ukendt-id";
-
     return res.status(200).json({
       success: true,
-      fileId: onlyOfficeFileId
+      fileId: String(onlyOfficeFileId),
+      fileUrl: secureFileUrl // <--- DETTE LINK SENDES NU RETUR TIL BUBBLE!
     });
 
   } catch (globalError) {
     return res.status(500).json({
       error: 'Uventet global fejl i backenden',
-      message: globalError.message,
-      details: { URL_under_fejl: uploadUrl }
+      message: globalError.message
     });
   }
 };
