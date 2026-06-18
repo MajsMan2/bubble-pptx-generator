@@ -33,8 +33,18 @@ module.exports = async function handler(req, res) {
 
   try {
     let body = req.body;
+
+    // Sikker JSON-parsing med tydelig fejlbesked og rawBody til debug
     if (typeof body === 'string') {
-      body = JSON.parse(body);
+      try {
+        body = JSON.parse(body);
+      } catch (parseError) {
+        return res.status(400).json({
+          error: 'Ugyldig JSON i request body',
+          message: parseError.message,
+          rawBody: body.substring(0, 300)
+        });
+      }
     }
 
     const { template_url, placeholders, company_unique_id, company_name } = body;
