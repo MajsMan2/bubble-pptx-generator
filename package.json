@@ -1,0 +1,12 @@
+{
+  "name": "bubble-pptx-generator",
+  "version": "1.0.0",
+  "main": "api/generate.js",
+  "scripts": {
+    "start": "node api/generate.js"
+  },
+  "dependencies": {
+    "pptx-automizer": "^1.0.0",
+    "axios": "^1.6.0"
+  }
+}
