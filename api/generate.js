@@ -160,18 +160,19 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // --- SKRIDT 3.5: GENERER OFFENTLIGT DELINGSLINK (UDEN LOGIN) ---
+    // --- SKRIDT 3.5: OFFENTLIG DELING VIA UNIVERSAL ENDPOINT ---
     let secureFileUrl = "";
-    let linkDebugInfo = "OK - Offentligt redigeringslink oprettet succesfuldt via API";
+    let linkDebugInfo = "OK - Offentligt redigeringslink oprettet";
 
     if (onlyOfficeFileId !== "ukendt-id") {
       try {
-        // Vi kalder share/file/{id} i stedet for file/{id}/link for at lave et ægte eksternt adgangslink
-        const shareEndpoint = `${baseUrl}/api/2.0/files/share/file/${onlyOfficeFileId}`;
+        // Universelt DocSpace share-endpoint
+        const shareEndpoint = `${baseUrl}/api/2.0/files/share`;
         
         const shareResponse = await axios.post(shareEndpoint, {
-          shareType: 1,  // 1 = Public / Offentlig deling via link
-          access: 2      // 2 = Editing / Fuld redigeringsadgang (Brug 3 hvis det kun skal være Read-only)
+          fileId: Number(onlyOfficeFileId), // Sender id'et med i JSON body
+          shareType: 1,                    // 1 = Offentligt link (Public link)
+          access: 2                        // 2 = Redigeringsadgang (Edit)
         }, {
           headers: {
             'Authorization': `Bearer ${docSpaceToken}`,
@@ -180,25 +181,36 @@ module.exports = async function handler(req, res) {
         });
         
         const resData = shareResponse.data;
-        // ONLYOFFICE DocSpace returnerer typisk det offentlige link under response.link eller response.shareLink
         secureFileUrl = resData?.response?.link || 
                         resData?.response?.shareLink || 
                         resData?.link || 
                         resData?.shareLink || "";
                         
         if (!secureFileUrl) {
-          linkDebugInfo = "API godkendte deling, men svarede med en uventet JSON struktur: " + JSON.stringify(resData);
+          linkDebugInfo = "API svarede 200, men manglede URL i JSON: " + JSON.stringify(resData);
         }
       } catch (linkError) {
-        linkDebugInfo = "Fejl ved oprettelse af offentligt link: " + linkError.message + 
-                        (linkError.response?.data ? " - API svar: " + JSON.stringify(linkError.response.data) : "");
+        // Hvis universelt fejler, prøver vi det sekundære "invitation" link-endpoint
+        try {
+          const fallbackEndpoint = `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/shares`;
+          const altResponse = await axios.post(fallbackEndpoint, {
+            share: { shareType: 1, access: 2 }
+          }, {
+            headers: { 'Authorization': `Bearer ${docSpaceToken}`, 'Content-Type': 'application/json' }
+          });
+          secureFileUrl = altResponse.data?.response?.link || altResponse.data?.link || "";
+        } catch (altError) {
+          linkDebugInfo = `404 afhjulpet, men ny fejl opstod. Besked: ${linkError.message}. Detaljer: ` + JSON.stringify(linkError.response?.data || {});
+        }
       }
     } else {
-      linkDebugInfo = "Kunne ikke kalde share endpointet, da fileId ikke blev fundet i upload-svaret.";
+      linkDebugInfo = "Kunne ikke oprette link: Fandt ikke et gyldigt fileId i upload-svaret.";
     }
 
+    // Hvis alt fejler, giv dem i det mindste fallback web-url'en så systemet ikke crasher
     if (!secureFileUrl && fallbackWebUrl) {
       secureFileUrl = fallbackWebUrl;
+      linkDebugInfo += " -> Brugte intern fallback URL.";
     }
 
     if (secureFileUrl && secureFileUrl.startsWith('/')) {
