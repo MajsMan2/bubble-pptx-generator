@@ -20,7 +20,6 @@ module.exports = async function handler(req, res) {
 
   let templatePath = path.join('/tmp', `template_${Date.now()}.pptx`);
   let outputPath = path.join('/tmp', `output_${Date.now()}.pptx`);
-  let uploadUrl = "";
 
   try {
     let body = req.body;
@@ -90,7 +89,6 @@ module.exports = async function handler(req, res) {
             }
 
             const combinedElements = Array.from(new Set([...textElements, ...tableElements]));
-
             for (const element of combinedElements) {
               s.modifyElement(element, shapeModCb);
             }
@@ -120,19 +118,21 @@ module.exports = async function handler(req, res) {
       baseUrl = baseUrl.replace('/api/2.0', '');
     }
 
-    uploadUrl = `${baseUrl}/api/2.0/files/${folderId}/upload`;
-
     const form = new FormData();
     form.append('file', fs.createReadStream(outputPath));
 
     let onlyOfficeResponse;
     try {
-      onlyOfficeResponse = await axios.post(uploadUrl, form, {
-        headers: {
-          'Authorization': `Bearer ${docSpaceToken}`,
-          ...form.getHeaders()
+      onlyOfficeResponse = await axios.post(
+        `${baseUrl}/api/2.0/files/${folderId}/upload`,
+        form,
+        {
+          headers: {
+            'Authorization': `Bearer ${docSpaceToken}`,
+            ...form.getHeaders()
+          }
         }
-      });
+      );
     } catch (uploadError) {
       return res.status(500).json({
         error: 'Fejl under upload til ONLYOFFICE DocSpace API',
@@ -141,149 +141,126 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --- SKRIDT 3.2: FIND FILE ID & FALLBACK ---
+    // --- SKRIDT 3.2: FIND FILE ID ---
     const ooData = onlyOfficeResponse.data;
     let onlyOfficeFileId = "ukendt-id";
-    let fallbackWebUrl = "";
 
     if (ooData) {
-      if (ooData.id) onlyOfficeFileId = ooData.id;
-      else if (ooData.response?.id) onlyOfficeFileId = ooData.response.id;
-      else if (ooData.response?.Id) onlyOfficeFileId = ooData.response.Id;
-      else if (Array.isArray(ooData.response) && ooData.response[0]?.id) onlyOfficeFileId = ooData.response[0].id;
-      else if (Array.isArray(ooData.response) && ooData.response[0]?.Id) onlyOfficeFileId = ooData.response[0].Id;
-      else if (ooData.response?.file?.id) onlyOfficeFileId = ooData.response.file.id;
-
-      const fileObj = ooData.response?.file || (Array.isArray(ooData.response) ? ooData.response[0] : ooData.response);
-      if (fileObj) {
-        fallbackWebUrl = fileObj.webUrl || fileObj.WebUrl || fileObj.viewUrl || fileObj.ViewUrl || "";
-      }
+      if (ooData.id)                                                        onlyOfficeFileId = ooData.id;
+      else if (ooData.response?.id)                                         onlyOfficeFileId = ooData.response.id;
+      else if (ooData.response?.Id)                                         onlyOfficeFileId = ooData.response.Id;
+      else if (Array.isArray(ooData.response) && ooData.response[0]?.id)   onlyOfficeFileId = ooData.response[0].id;
+      else if (Array.isArray(ooData.response) && ooData.response[0]?.Id)   onlyOfficeFileId = ooData.response[0].Id;
+      else if (ooData.response?.file?.id)                                   onlyOfficeFileId = ooData.response.file.id;
     }
 
-    // --- SKRIDT 3.5: OFFENTLIG DELING ---
-    let secureFileUrl = "";
-    let linkDebugInfo = "OK - Offentligt link oprettet";
+    // --- SKRIDT 3.5: OPRET OFFENTLIGT EKSTERNT LINK MED EDIT-ADGANG ---
+    let shareToken = "";
+    let linkDebugInfo = "";
+
+    // Hjælpefunktion: udtræk shareLink/token fra et svar-objekt
+    const extractShareToken = (data) => {
+      if (!data) return "";
+      const r = data.response ?? data;
+      const candidates = [r, ...(Array.isArray(r) ? r : [])];
+      for (const c of candidates) {
+        // shareLink er typisk på formen: https://docspace.../s/TOKEN
+        const raw = c?.sharedTo?.shareLink || c?.shareLink || c?.link || c?.url || "";
+        if (raw) return raw;
+      }
+      return "";
+    };
 
     if (onlyOfficeFileId !== "ukendt-id") {
 
-      // Hjælpefunktion: udtræk shareLink fra et response-objekt
-      const extractLink = (data) => {
-        if (!data) return "";
-        const r = data.response ?? data;
-        // Direkte på response-objektet
-        if (r?.sharedTo?.shareLink) return r.sharedTo.shareLink;
-        if (r?.shareLink)           return r.shareLink;
-        if (r?.link)                return r.link;
-        if (r?.url)                 return r.url;
-        // Første element i et array
-        const first = Array.isArray(r) ? r[0] : null;
-        if (first?.sharedTo?.shareLink) return first.sharedTo.shareLink;
-        if (first?.shareLink)           return first.shareLink;
-        if (first?.link)                return first.link;
-        return "";
-      };
-
-      // ---
-      // Forsøg 1: POST /api/2.0/files/file/{id}/link
-      // Opretter det primære eksterne link (officielt DocSpace-endpoint).
-      // ---
+      // Forsøg 1: POST /api/2.0/files/file/{id}/link  (primært eksternt link, Edit-adgang)
       try {
-        const createLinkRes = await axios.post(
+        const r = await axios.post(
           `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`,
-          {},   // tom body — API'et kræver ingen parametre her
+          { access: 2 },   // 2 = Edit
           { headers: { 'Authorization': `Bearer ${docSpaceToken}`, 'Content-Type': 'application/json' } }
         );
-        secureFileUrl = extractLink(createLinkRes.data);
-        if (secureFileUrl) {
-          linkDebugInfo = "OK - primært eksternt link oprettet via POST /file/:id/link";
-        }
+        shareToken = extractShareToken(r.data);
+        linkDebugInfo = shareToken
+          ? "POST /file/:id/link (Edit)"
+          : `POST /link 200 men tomt: ${JSON.stringify(r.data).substring(0, 150)}`;
       } catch (e1) {
-        linkDebugInfo = `POST /link fejlede (${e1.response?.status ?? e1.message})`;
+        linkDebugInfo = `POST /link fejl (${e1.response?.status ?? e1.message})`;
       }
 
-      // ---
-      // Forsøg 2: GET /api/2.0/files/file/{id}/link
-      // Henter det primære eksterne link, hvis det allerede eksisterer.
-      // ---
-      if (!secureFileUrl) {
+      // Forsøg 2: GET /api/2.0/files/file/{id}/link  (hent eksisterende primært link)
+      if (!shareToken) {
         try {
-          const getLinkRes = await axios.get(
+          const r = await axios.get(
             `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`,
             { headers: { 'Authorization': `Bearer ${docSpaceToken}` } }
           );
-          secureFileUrl = extractLink(getLinkRes.data);
-          if (secureFileUrl) {
-            linkDebugInfo = "OK - primært eksternt link hentet via GET /file/:id/link";
-          }
+          shareToken = extractShareToken(r.data);
+          linkDebugInfo += shareToken
+            ? " | GET /file/:id/link OK"
+            : ` | GET /link tomt: ${JSON.stringify(r.data).substring(0, 150)}`;
         } catch (e2) {
-          linkDebugInfo += ` | GET /link fejlede (${e2.response?.status ?? e2.message})`;
+          linkDebugInfo += ` | GET /link fejl (${e2.response?.status ?? e2.message})`;
         }
       }
 
-      // ---
-      // Forsøg 3: PUT /api/2.0/files/file/{id}/links
-      // Sætter et eksternt link med adgangsniveau (det officielle "Set an external link"-endpoint).
-      // ---
-      if (!secureFileUrl) {
+      // Forsøg 3: PUT /api/2.0/files/file/{id}/links  (Set external link, Edit-adgang)
+      if (!shareToken) {
         try {
-          const putLinksRes = await axios.put(
+          const r = await axios.put(
             `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/links`,
             { access: 2, linkType: 2, denyDownload: false },
             { headers: { 'Authorization': `Bearer ${docSpaceToken}`, 'Content-Type': 'application/json' } }
           );
-          secureFileUrl = extractLink(putLinksRes.data);
-          if (secureFileUrl) {
-            linkDebugInfo = "OK - eksternt link oprettet via PUT /file/:id/links";
-          } else {
-            linkDebugInfo += ` | PUT /links svarede 200 men uden link: ${JSON.stringify(putLinksRes.data).substring(0, 200)}`;
-          }
+          shareToken = extractShareToken(r.data);
+          linkDebugInfo += shareToken
+            ? " | PUT /links OK"
+            : ` | PUT /links tomt: ${JSON.stringify(r.data).substring(0, 150)}`;
         } catch (e3) {
-          linkDebugInfo += ` | PUT /links fejlede (${e3.response?.status ?? e3.message})`;
+          linkDebugInfo += ` | PUT /links fejl (${e3.response?.status ?? e3.message})`;
         }
       }
 
-      // ---
-      // Forsøg 4: GET /api/2.0/files/file/{id}/links
-      // Henter alle eksisterende eksterne links på filen.
-      // ---
-      if (!secureFileUrl) {
+      // Forsøg 4: GET /api/2.0/files/file/{id}/links  (hent alle eksterne links)
+      if (!shareToken) {
         try {
-          const getLinksRes = await axios.get(
+          const r = await axios.get(
             `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/links`,
             { headers: { 'Authorization': `Bearer ${docSpaceToken}` } }
           );
-          secureFileUrl = extractLink(getLinksRes.data);
-          if (secureFileUrl) {
-            linkDebugInfo = "OK - eksternt link hentet via GET /file/:id/links";
-          } else {
-            linkDebugInfo += ` | GET /links svarede uden link: ${JSON.stringify(getLinksRes.data).substring(0, 200)}`;
-          }
+          shareToken = extractShareToken(r.data);
+          linkDebugInfo += shareToken
+            ? " | GET /links OK"
+            : ` | GET /links tomt: ${JSON.stringify(r.data).substring(0, 150)}`;
         } catch (e4) {
-          linkDebugInfo += ` | GET /links fejlede (${e4.response?.status ?? e4.message})`;
+          linkDebugInfo += ` | GET /links fejl (${e4.response?.status ?? e4.message})`;
         }
       }
+    }
 
-      // ---
-      // Forsøg 5: Byg direkte editor-URL som absolut nødløsning
-      // ---
-      if (!secureFileUrl) {
-        secureFileUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&action=view`;
-        linkDebugInfo += " | Brugte direkte editor-URL som nødløsning";
+    // --- SKRIDT 3.6: BYGG EDITOR-URL ---
+    // DocSpace's doceditor-URL åbner filen direkte i den fulde editor uden login,
+    // når der medfølger et gyldigt share-token. Uden token virker den kun for
+    // brugere der er logget ind, men er stadig bedre end ingenting.
+    let editorUrl = "";
+
+    if (shareToken) {
+      // Uddrag token-delen fra shareLink (typisk: https://host/s/XXXTOKEN)
+      const tokenMatch = shareToken.match(/\/s\/([^/?#]+)/);
+      const token = tokenMatch ? tokenMatch[1] : "";
+
+      if (token) {
+        // Åbner direkte i editoren med share-token — ingen login krævet
+        editorUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&share=${token}&action=edit&type=desktop`;
+      } else {
+        // shareLink var en fuld URL men uden /s/-mønster — brug den direkte
+        editorUrl = shareToken;
       }
-
+      linkDebugInfo = `OK (${linkDebugInfo.trim()})`;
     } else {
-      linkDebugInfo = "Kunne ikke oprette link: Fandt ikke et gyldigt fileId i upload-svaret.";
-    }
-
-    // Sikr at relative URL'er bliver absolutte
-    if (secureFileUrl && secureFileUrl.startsWith('/')) {
-      secureFileUrl = baseUrl + secureFileUrl;
-    }
-
-    // Fallback til intern webUrl fra upload-svaret, hvis alt andet er tomt
-    if (!secureFileUrl && fallbackWebUrl) {
-      secureFileUrl = fallbackWebUrl;
-      linkDebugInfo += " -> Brugte intern fallback URL fra upload-svar.";
+      // Ingen share-token fundet — byg URL der kræver login
+      editorUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&action=edit&type=desktop`;
+      linkDebugInfo = `Ingen share-token — editor-URL kræver login. Debug: ${linkDebugInfo}`;
     }
 
     // --- SKRIDT 4: OPRYDNING & SVAR ---
@@ -293,7 +270,8 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({
       success: true,
       fileId: String(onlyOfficeFileId),
-      fileUrl: secureFileUrl,
+      fileUrl: editorUrl,       // Direkte editor-link klar til at sende til brugeren
+      shareLink: shareToken,    // Råt share-link fra DocSpace (hvis tilgængeligt)
       debugInfo: linkDebugInfo
     });
 
