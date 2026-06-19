@@ -13,14 +13,54 @@ try {
   console.error("Kunne ikke loade pptx-automizer:", e);
 }
 
-// Genererer 4 tilfældige alfanumeriske tegn, fx "f3r5"
 function randomId() {
   return Math.random().toString(36).substring(2, 6);
 }
 
-// Renser firmanavn så det er sikkert at bruge i et filnavn
 function safeFilename(name) {
   return String(name).replace(/[^a-zA-Z0-9æøåÆØÅ\-_]/g, '_').substring(0, 60);
+}
+
+function tryParseArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed;
+      } catch (e) {}
+    }
+  }
+  return null;
+}
+
+// Returnerer true hvis værdien er tom/mangler/er en udfyldt placeholder-streng
+function isEmpty(value) {
+  if (value === null || value === undefined) return true;
+  const str = String(value).trim();
+  if (str === '') return true;
+  // Bubble sender udfyldte placeholders som "<feltnavn>" hvis de ikke er sat
+  if (/^<[^>]+>$/.test(str)) return true;
+  return false;
+}
+
+function buildReplaceParams(placeholders) {
+  const params = [];
+  for (const [key, value] of Object.entries(placeholders)) {
+    // Hvis værdien er tom eller en uudfyldt placeholder → erstat med tom streng
+    if (isEmpty(value)) {
+      params.push({ replace: key,          by: { text: '' } });
+      params.push({ replace: `{{${key}}}`, by: { text: '' } });
+      continue;
+    }
+
+    const arr = tryParseArray(value);
+    const text = arr ? arr.join('\n') : String(value);
+    params.push({ replace: key,          by: { text } });
+    params.push({ replace: `{{${key}}}`, by: { text } });
+  }
+  return params;
 }
 
 module.exports = async function handler(req, res) {
@@ -34,7 +74,6 @@ module.exports = async function handler(req, res) {
   try {
     let body = req.body;
 
-    // Sikker JSON-parsing med tydelig fejlbesked og rawBody til debug
     if (typeof body === 'string') {
       try {
         body = JSON.parse(body);
@@ -53,7 +92,6 @@ module.exports = async function handler(req, res) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
     }
 
-    // Byg filnavn: 4 tilfældige tegn + firmanavn, fx "f3r5_TestCompany.pptx"
     const filePrefix = company_name
       ? `${randomId()}_${safeFilename(company_name)}`
       : `${randomId()}_rapport`;
@@ -61,9 +99,7 @@ module.exports = async function handler(req, res) {
 
     // --- SKRIDT 1: DOWNLOAD SKABELON ---
     let finalUrl = template_url.trim();
-    if (finalUrl.startsWith('//')) {
-      finalUrl = 'https:' + finalUrl;
-    }
+    if (finalUrl.startsWith('//')) finalUrl = 'https:' + finalUrl;
 
     try {
       const templateResponse = await axios.get(finalUrl, { responseType: 'arraybuffer' });
@@ -91,13 +127,18 @@ module.exports = async function handler(req, res) {
         const info = await pres.getInfo();
         const slides = info.slidesByTemplate('base');
 
-        const replaceParams = [];
-        for (const [key, value] of Object.entries(placeholders)) {
-          replaceParams.push({ replace: key, by: { text: String(value) } });
-          replaceParams.push({ replace: `{{${key}}}`, by: { text: String(value) } });
-        }
-
+        const replaceParams = buildReplaceParams(placeholders);
         const shapeModCb = modify.replaceText(replaceParams);
+
+        // Identificer array-placeholders med mere end ét element
+        const arrayPlaceholders = {};
+        for (const [key, value] of Object.entries(placeholders)) {
+          if (isEmpty(value)) continue;
+          const arr = tryParseArray(value);
+          if (arr && arr.length > 1) {
+            arrayPlaceholders[key] = arr;
+          }
+        }
 
         for (const slide of slides) {
           pres.addSlide('base', slide.number, async (s) => {
@@ -115,7 +156,74 @@ module.exports = async function handler(req, res) {
               console.error("Kunne ikke scanne efter tabeller på slide " + slide.number, tableError);
             }
 
-            const combinedElements = Array.from(new Set([...textElements, ...tableElements]));
+            // Tabelrække-duplikering for array-værdier
+            for (const tableName of tableElements) {
+              try {
+                s.modifyElement(tableName, async (element, xmlData) => {
+                  const xmlStr = typeof xmlData === 'string' ? xmlData : JSON.stringify(xmlData);
+
+                  let hasArrayPlaceholder = false;
+                  let arrayKey = null;
+                  let arrayValues = null;
+
+                  for (const [key, values] of Object.entries(arrayPlaceholders)) {
+                    if (xmlStr.includes(key) || xmlStr.includes(`{{${key}}}`)) {
+                      hasArrayPlaceholder = true;
+                      arrayKey = key;
+                      arrayValues = values;
+                      break;
+                    }
+                  }
+
+                  if (!hasArrayPlaceholder || !arrayValues) return element;
+
+                  if (xmlData && xmlData.elements) {
+                    const tblEl = xmlData.elements.find(el => el.name === 'a:tbl' || el.name === 'tbl');
+                    if (tblEl && tblEl.elements) {
+                      const rows = tblEl.elements.filter(el => el.name === 'a:tr' || el.name === 'tr');
+
+                      let templateRowIndex = -1;
+                      for (let i = 0; i < rows.length; i++) {
+                        const rowStr = JSON.stringify(rows[i]);
+                        if (rowStr.includes(arrayKey) || rowStr.includes(`{{${arrayKey}}}`)) {
+                          templateRowIndex = i;
+                          break;
+                        }
+                      }
+
+                      if (templateRowIndex >= 0) {
+                        const templateRow = rows[templateRowIndex];
+                        const newRows = [];
+
+                        for (const arrayValue of arrayValues) {
+                          const rowCopy = JSON.parse(JSON.stringify(templateRow));
+                          const rowStr = JSON.stringify(rowCopy);
+                          const replacedStr = rowStr
+                            .replace(new RegExp(arrayKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), String(arrayValue))
+                            .replace(new RegExp(`\\{\\{${arrayKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\}\\}`, 'g'), String(arrayValue));
+                          newRows.push(JSON.parse(replacedStr));
+                        }
+
+                        tblEl.elements.splice(
+                          tblEl.elements.indexOf(templateRow),
+                          1,
+                          ...newRows
+                        );
+                      }
+                    }
+                  }
+
+                  return element;
+                });
+              } catch (tableModError) {
+                console.error(`Fejl ved tabelmanipulation af ${tableName}:`, tableModError);
+              }
+
+              s.modifyElement(tableName, shapeModCb);
+            }
+
+            // Normal teksterstatning — tomme værdier gør placeholders usynlige
+            const combinedElements = Array.from(new Set([...textElements]));
             for (const element of combinedElements) {
               s.modifyElement(element, shapeModCb);
             }
@@ -198,7 +306,6 @@ module.exports = async function handler(req, res) {
 
     if (onlyOfficeFileId !== "ukendt-id") {
 
-      // Forsøg 1: POST /api/2.0/files/file/{id}/link  (primært eksternt link, Edit-adgang)
       try {
         const r = await axios.post(
           `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`,
@@ -213,7 +320,6 @@ module.exports = async function handler(req, res) {
         linkDebugInfo = `POST /link fejl (${e1.response?.status ?? e1.message})`;
       }
 
-      // Forsøg 2: GET /api/2.0/files/file/{id}/link
       if (!shareToken) {
         try {
           const r = await axios.get(
@@ -229,7 +335,6 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Forsøg 3: PUT /api/2.0/files/file/{id}/links
       if (!shareToken) {
         try {
           const r = await axios.put(
@@ -246,7 +351,6 @@ module.exports = async function handler(req, res) {
         }
       }
 
-      // Forsøg 4: GET /api/2.0/files/file/{id}/links
       if (!shareToken) {
         try {
           const r = await axios.get(
@@ -269,11 +373,9 @@ module.exports = async function handler(req, res) {
     if (shareToken) {
       const tokenMatch = shareToken.match(/\/s\/([^/?#]+)/);
       const token = tokenMatch ? tokenMatch[1] : "";
-
       editorUrl = token
         ? `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&share=${token}&action=edit&type=desktop`
         : shareToken;
-
       linkDebugInfo = `OK (${linkDebugInfo.trim()})`;
     } else {
       editorUrl = `${baseUrl}/doceditor?fileId=${onlyOfficeFileId}&action=edit&type=desktop`;
