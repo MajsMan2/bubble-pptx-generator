@@ -173,6 +173,133 @@ function cleanupResidualPlaceholders(pptxPath, placeholders) {
   }
 }
 
+// --- SLET SLIDES VIA ZIP/XML ---
+// slidesToDelete: array af 1-baserede slide-numre, fx [1, 3, 5]
+function deleteSlides(pptxPath, slidesToDelete) {
+  if (!slidesToDelete || slidesToDelete.length === 0) return;
+  try {
+    const zip = new AdmZip(pptxPath);
+
+    // Sorter faldende så vi sletter bagfra og undgår indeks-forskydning
+    const sorted = [...slidesToDelete].map(Number).sort((a, b) => b - a);
+
+    // Læs presentation.xml for at finde slide-referencer
+    const presEntry = zip.getEntry('ppt/presentation.xml');
+    if (!presEntry) return;
+    let presXml = presEntry.getData().toString('utf8');
+
+    // Find alle slide-id'er i rækkefølge: <p:sldId id="..." r:id="rId..."/>
+    const sldIdRegex = /<p:sldId[^/]* r:id="(rId\d+)"[^/]*\/>/g;
+    const slideRefs = [];
+    let m;
+    while ((m = sldIdRegex.exec(presXml)) !== null) {
+      slideRefs.push({ full: m[0], rId: m[1] });
+    }
+
+    // Læs .rels for at finde filnavne
+    const relsEntry = zip.getEntry('ppt/_rels/presentation.xml.rels');
+    if (!relsEntry) return;
+    let relsXml = relsEntry.getData().toString('utf8');
+
+    for (const slideNum of sorted) {
+      const idx = slideNum - 1;
+      if (idx < 0 || idx >= slideRefs.length) continue;
+      const { full, rId } = slideRefs[idx];
+
+      // Find filnavn fra rels: Target="slides/slideN.xml"
+      const relMatch = relsXml.match(new RegExp(`<Relationship[^>]*Id="${rId}"[^>]*Target="([^"]+)"[^>]*/>`));
+      if (!relMatch) continue;
+      const target = relMatch[1]; // fx "slides/slide3.xml"
+      const slidePath = `ppt/${target}`;
+      const slideRelsPath = `ppt/slides/_rels/${path.basename(target)}.rels`;
+
+      // Fjern slide-filen og dens .rels
+      zip.deleteFile(slidePath);
+      zip.deleteFile(slideRelsPath);
+
+      // Fjern reference i presentation.xml
+      presXml = presXml.replace(full, '');
+
+      // Fjern reference i .rels
+      relsXml = relsXml.replace(relMatch[0], '');
+
+      // Fjern fra [Content_Types].xml
+      const ctEntry = zip.getEntry('[Content_Types].xml');
+      if (ctEntry) {
+        let ctXml = ctEntry.getData().toString('utf8');
+        const ctPath = `/${slidePath}`;
+        ctXml = ctXml.replace(new RegExp(`<Override[^>]*PartName="${ctPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*/>`), '');
+        zip.updateFile('[Content_Types].xml', Buffer.from(ctXml, 'utf8'));
+      }
+
+      slideRefs.splice(idx, 1); // Opdater lokalt array
+    }
+
+    zip.updateFile('ppt/presentation.xml', Buffer.from(presXml, 'utf8'));
+    zip.updateFile('ppt/_rels/presentation.xml.rels', Buffer.from(relsXml, 'utf8'));
+    zip.writeZip(pptxPath);
+    console.log(`Slettede slides: ${slidesToDelete.join(', ')}`);
+  } catch (e) {
+    console.error("deleteSlides fejlede:", e);
+  }
+}
+
+// --- SLET TABELLER VIA NAVN I XML ---
+// tablesToDelete: array af tabelnavne som de er sat i PowerPoint, fx ["tabel_affald", "tabel_bio"]
+// Tabeller navngives i PowerPoint: Hjem → Arranger → Markeringsrude → omdøb elementet
+function deleteTables(pptxPath, tablesToDelete) {
+  if (!tablesToDelete || tablesToDelete.length === 0) return;
+  try {
+    const zip = new AdmZip(pptxPath);
+    const entries = zip.getEntries();
+
+    for (const entry of entries) {
+      if (!entry.entryName.match(/^ppt\/slides\/slide\d+\.xml$/)) continue;
+
+      let xml = entry.getData().toString('utf8');
+      let changed = false;
+
+      for (const tableName of tablesToDelete) {
+        const escaped = tableName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // En tabel i PPTX sidder i et <p:sp> eller <p:graphicFrame> element
+        // med et <p:cNvPr name="TABELNAVN"> attribut
+        // Vi matcher hele det omsluttende element og fjerner det
+
+        // Forsøg 1: <p:graphicFrame> (tabeller bruger typisk dette)
+        const gfRegex = new RegExp(
+          `<p:graphicFrame>(?:(?!<p:graphicFrame>)[\\s\\S])*?<p:cNvPr[^>]*name="${escaped}"[\\s\\S]*?<\\/p:graphicFrame>`,
+          'g'
+        );
+        if (gfRegex.test(xml)) {
+          xml = xml.replace(gfRegex, '');
+          changed = true;
+          continue;
+        }
+
+        // Forsøg 2: <p:sp> (shapes/tekstbokse med tabel-lignende indhold)
+        const spRegex = new RegExp(
+          `<p:sp>(?:(?!<p:sp>)[\\s\\S])*?<p:cNvPr[^>]*name="${escaped}"[\\s\\S]*?<\\/p:sp>`,
+          'g'
+        );
+        if (spRegex.test(xml)) {
+          xml = xml.replace(spRegex, '');
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        zip.updateFile(entry.entryName, Buffer.from(xml, 'utf8'));
+      }
+    }
+
+    zip.writeZip(pptxPath);
+    console.log(`Slettede tabeller: ${tablesToDelete.join(', ')}`);
+  } catch (e) {
+    console.error("deleteTables fejlede:", e);
+  }
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -196,7 +323,7 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    const { template_url, placeholders, company_unique_id, company_name } = body;
+    const { template_url, placeholders, company_unique_id, company_name, delete_slides, delete_tables } = body;
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
@@ -348,6 +475,14 @@ module.exports = async function handler(req, res) {
     // --- SKRIDT 2.5: XML-NIVEAU CLEANUP ---
     // Fjerner alle tilbageværende {{...}} og "null"-værdier direkte i PPTX-XML
     cleanupResidualPlaceholders(outputPath, placeholders);
+
+    // --- SKRIDT 2.6: SLET SLIDES OG TABELLER ---
+    // delete_slides: [1, 3, 5]  — 1-baserede slide-numre
+    // delete_tables: ["tabel_affald", "tabel_bio"] — navne sat i PowerPoint
+    const slidesToDelete = tryParseArray(delete_slides) || (Array.isArray(delete_slides) ? delete_slides : []);
+    const tablesToDelete = tryParseArray(delete_tables) || (Array.isArray(delete_tables) ? delete_tables : []);
+    deleteSlides(outputPath, slidesToDelete);
+    deleteTables(outputPath, tablesToDelete);
 
     // --- SKRIDT 3: UPLOAD TIL ONLYOFFICE ---
     const docSpaceUrl = process.env.DOCSPACE_URL;
