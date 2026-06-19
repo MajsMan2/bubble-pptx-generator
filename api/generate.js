@@ -35,31 +35,36 @@ function tryParseArray(value) {
   return null;
 }
 
-// Returnerer true hvis værdien er tom/mangler/er en udfyldt placeholder-streng
+// Tom hvis: null, undefined, tom streng, "null", "<feltnavn>" (uudfyldt Bubble placeholder)
 function isEmpty(value) {
   if (value === null || value === undefined) return true;
   const str = String(value).trim();
   if (str === '') return true;
-  // Bubble sender udfyldte placeholders som "<feltnavn>" hvis de ikke er sat
-  if (/^<[^>]+>$/.test(str)) return true;
+  if (str.toLowerCase() === 'null') return true;
+  if (str.toLowerCase() === 'undefined') return true;
+  if (/^<[^>]+>$/.test(str)) return true;  // "<feltnavn>"
   return false;
 }
 
 function buildReplaceParams(placeholders) {
   const params = [];
   for (const [key, value] of Object.entries(placeholders)) {
-    // Hvis værdien er tom eller en uudfyldt placeholder → erstat med tom streng
     if (isEmpty(value)) {
       params.push({ replace: key,          by: { text: '' } });
       params.push({ replace: `{{${key}}}`, by: { text: '' } });
       continue;
     }
-
     const arr = tryParseArray(value);
     const text = arr ? arr.join('\n') : String(value);
     params.push({ replace: key,          by: { text } });
     params.push({ replace: `{{${key}}}`, by: { text } });
   }
+
+  // Catch-all: erstat alle tilbageværende {{...}} og <...> mønstre med tom streng
+  // Dette håndterer placeholders der slet ikke er med i placeholders-objektet
+  params.push({ replace: /\{\{[^}]+\}\}/g, by: { text: '' } });
+  params.push({ replace: /<[a-zA-Z_][^>]*>/g, by: { text: '' } });
+
   return params;
 }
 
@@ -198,9 +203,10 @@ module.exports = async function handler(req, res) {
                         for (const arrayValue of arrayValues) {
                           const rowCopy = JSON.parse(JSON.stringify(templateRow));
                           const rowStr = JSON.stringify(rowCopy);
+                          const escapedKey = arrayKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                           const replacedStr = rowStr
-                            .replace(new RegExp(arrayKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), String(arrayValue))
-                            .replace(new RegExp(`\\{\\{${arrayKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\}\\}`, 'g'), String(arrayValue));
+                            .replace(new RegExp(escapedKey, 'g'), String(arrayValue))
+                            .replace(new RegExp(`\\{\\{${escapedKey}\\}\\}`, 'g'), String(arrayValue));
                           newRows.push(JSON.parse(replacedStr));
                         }
 
@@ -222,7 +228,7 @@ module.exports = async function handler(req, res) {
               s.modifyElement(tableName, shapeModCb);
             }
 
-            // Normal teksterstatning — tomme værdier gør placeholders usynlige
+            // Normal teksterstatning på tekstfelter
             const combinedElements = Array.from(new Set([...textElements]));
             for (const element of combinedElements) {
               s.modifyElement(element, shapeModCb);
