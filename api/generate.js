@@ -2,6 +2,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const FormData = require('form-data');
+const AdmZip = require('adm-zip');
 
 let Automizer;
 let modify;
@@ -35,14 +36,13 @@ function tryParseArray(value) {
   return null;
 }
 
-// Tom hvis: null, undefined, tom streng, "null", "<feltnavn>" (uudfyldt Bubble placeholder)
 function isEmpty(value) {
   if (value === null || value === undefined) return true;
   const str = String(value).trim();
   if (str === '') return true;
   if (str.toLowerCase() === 'null') return true;
   if (str.toLowerCase() === 'undefined') return true;
-  if (/^<[^>]+>$/.test(str)) return true;  // "<feltnavn>"
+  if (/^<[^>]+>$/.test(str)) return true;
   return false;
 }
 
@@ -59,13 +59,60 @@ function buildReplaceParams(placeholders) {
     params.push({ replace: key,          by: { text } });
     params.push({ replace: `{{${key}}}`, by: { text } });
   }
-
-  // Catch-all: erstat alle tilbageværende {{...}} og <...> mønstre med tom streng
-  // Dette håndterer placeholders der slet ikke er med i placeholders-objektet
-  params.push({ replace: /\{\{[^}]+\}\}/g, by: { text: '' } });
-  params.push({ replace: /<[a-zA-Z_][^>]*>/g, by: { text: '' } });
-
   return params;
+}
+
+// --- POST-PROCESSING: XML-niveau cleanup ---
+// Efter automizer er færdig, åbner vi PPTX som ZIP og erstatter
+// alle tilbageværende {{...}} og <placeholder> mønstre direkte i XML.
+function cleanupResidualPlaceholders(pptxPath, placeholders) {
+  try {
+    const zip = new AdmZip(pptxPath);
+    const entries = zip.getEntries();
+
+    for (const entry of entries) {
+      // Kun slide XML-filer
+      if (!entry.entryName.match(/^ppt\/slides\/slide\d+\.xml$/)) continue;
+
+      let xml = entry.getData().toString('utf8');
+      let changed = false;
+
+      // 1) Erstat kendte placeholders med deres værdier (eller tom streng)
+      for (const [key, value] of Object.entries(placeholders)) {
+        const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const replacement = isEmpty(value) ? '' : String(tryParseArray(value) ? tryParseArray(value).join('\n') : value);
+
+        // {{key}} format
+        const re1 = new RegExp(`\\{\\{${escapedKey}\\}\\}`, 'g');
+        if (re1.test(xml)) { xml = xml.replace(re1, replacement); changed = true; }
+
+        // <key> format (kun hvis det ligner en placeholder, ikke HTML-tags)
+        const re2 = new RegExp(`<${escapedKey}>`, 'g');
+        if (re2.test(xml)) { xml = xml.replace(re2, replacement); changed = true; }
+      }
+
+      // 2) Catch-all: fjern alle tilbageværende {{...}} mønstre
+      if (/\{\{[^}]+\}\}/.test(xml)) {
+        xml = xml.replace(/\{\{[^}]+\}\}/g, '');
+        changed = true;
+      }
+
+      // 3) Erstat "null" der står alene som tekstindhold i en XML-celle
+      // Matcher >null< og >null < og lignende
+      if (/>[  ]*null[  ]*</.test(xml)) {
+        xml = xml.replace(/(?<=>[ ]*)null(?=[ ]*<)/g, '');
+        changed = true;
+      }
+
+      if (changed) {
+        zip.updateFile(entry.entryName, Buffer.from(xml, 'utf8'));
+      }
+    }
+
+    zip.writeZip(pptxPath);
+  } catch (cleanupError) {
+    console.error("Post-processing cleanup fejlede:", cleanupError);
+  }
 }
 
 module.exports = async function handler(req, res) {
@@ -116,7 +163,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // --- SKRIDT 2: FLET POWERPOINT ---
+    // --- SKRIDT 2: FLET POWERPOINT VIA AUTOMIZER ---
     if (Automizer && modify) {
       try {
         const automizer = new Automizer({
@@ -135,7 +182,6 @@ module.exports = async function handler(req, res) {
         const replaceParams = buildReplaceParams(placeholders);
         const shapeModCb = modify.replaceText(replaceParams);
 
-        // Identificer array-placeholders med mere end ét element
         const arrayPlaceholders = {};
         for (const [key, value] of Object.entries(placeholders)) {
           if (isEmpty(value)) continue;
@@ -161,26 +207,23 @@ module.exports = async function handler(req, res) {
               console.error("Kunne ikke scanne efter tabeller på slide " + slide.number, tableError);
             }
 
-            // Tabelrække-duplikering for array-værdier
             for (const tableName of tableElements) {
               try {
                 s.modifyElement(tableName, async (element, xmlData) => {
                   const xmlStr = typeof xmlData === 'string' ? xmlData : JSON.stringify(xmlData);
 
-                  let hasArrayPlaceholder = false;
                   let arrayKey = null;
                   let arrayValues = null;
 
                   for (const [key, values] of Object.entries(arrayPlaceholders)) {
                     if (xmlStr.includes(key) || xmlStr.includes(`{{${key}}}`)) {
-                      hasArrayPlaceholder = true;
                       arrayKey = key;
                       arrayValues = values;
                       break;
                     }
                   }
 
-                  if (!hasArrayPlaceholder || !arrayValues) return element;
+                  if (!arrayKey || !arrayValues) return element;
 
                   if (xmlData && xmlData.elements) {
                     const tblEl = xmlData.elements.find(el => el.name === 'a:tbl' || el.name === 'tbl');
@@ -199,11 +242,11 @@ module.exports = async function handler(req, res) {
                       if (templateRowIndex >= 0) {
                         const templateRow = rows[templateRowIndex];
                         const newRows = [];
+                        const escapedKey = arrayKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
                         for (const arrayValue of arrayValues) {
                           const rowCopy = JSON.parse(JSON.stringify(templateRow));
                           const rowStr = JSON.stringify(rowCopy);
-                          const escapedKey = arrayKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                           const replacedStr = rowStr
                             .replace(new RegExp(escapedKey, 'g'), String(arrayValue))
                             .replace(new RegExp(`\\{\\{${escapedKey}\\}\\}`, 'g'), String(arrayValue));
@@ -228,7 +271,6 @@ module.exports = async function handler(req, res) {
               s.modifyElement(tableName, shapeModCb);
             }
 
-            // Normal teksterstatning på tekstfelter
             const combinedElements = Array.from(new Set([...textElements]));
             for (const element of combinedElements) {
               s.modifyElement(element, shapeModCb);
@@ -244,6 +286,10 @@ module.exports = async function handler(req, res) {
     } else {
       fs.copyFileSync(templatePath, outputPath);
     }
+
+    // --- SKRIDT 2.5: XML-NIVEAU CLEANUP ---
+    // Fjerner alle tilbageværende {{...}} og "null"-værdier direkte i PPTX-XML
+    cleanupResidualPlaceholders(outputPath, placeholders);
 
     // --- SKRIDT 3: UPLOAD TIL ONLYOFFICE ---
     const docSpaceUrl = process.env.DOCSPACE_URL;
@@ -311,7 +357,6 @@ module.exports = async function handler(req, res) {
     };
 
     if (onlyOfficeFileId !== "ukendt-id") {
-
       try {
         const r = await axios.post(
           `${baseUrl}/api/2.0/files/file/${onlyOfficeFileId}/link`,
