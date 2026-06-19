@@ -63,44 +63,102 @@ function buildReplaceParams(placeholders) {
 }
 
 // --- POST-PROCESSING: XML-niveau cleanup ---
-// Efter automizer er færdig, åbner vi PPTX som ZIP og erstatter
-// alle tilbageværende {{...}} og <placeholder> mønstre direkte i XML.
+// PPTX er en ZIP med XML-filer. PowerPoint splitter ofte tekst som
+// "{{farlig_genbrug_kg_tons}}" over flere <a:r>-noder, fx:
+//   <a:r><a:t>{{farlig_gen</a:t></a:r><a:r><a:t>brug_kg_tons}}</a:t></a:r>
+// Det betyder at en simpel string-replace ikke finder dem.
+// Løsning: saml alle <a:t>-indhold inden for en <a:p> (paragraf) til én
+// streng, lav erstatninger, og skriv resultatet tilbage i første <a:r>.
 function cleanupResidualPlaceholders(pptxPath, placeholders) {
   try {
     const zip = new AdmZip(pptxPath);
     const entries = zip.getEntries();
 
+    // Byg en lookup: { "{{key}}": "value", "key": "value", ... }
+    const lookup = {};
+    for (const [key, value] of Object.entries(placeholders)) {
+      const replacement = isEmpty(value)
+        ? ''
+        : String(tryParseArray(value) ? tryParseArray(value).join('\n') : value);
+      lookup[`{{${key}}}`] = replacement;
+      lookup[key] = replacement;
+    }
+
     for (const entry of entries) {
-      // Kun slide XML-filer
       if (!entry.entryName.match(/^ppt\/slides\/slide\d+\.xml$/)) continue;
 
       let xml = entry.getData().toString('utf8');
       let changed = false;
 
-      // 1) Erstat kendte placeholders med deres værdier (eller tom streng)
-      for (const [key, value] of Object.entries(placeholders)) {
-        const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const replacement = isEmpty(value) ? '' : String(tryParseArray(value) ? tryParseArray(value).join('\n') : value);
+      // TRIN 1: Saml splittede placeholders inden for samme <a:p>
+      // Erstat indholdet af alle <a:t>...</a:t> sekvenser i en paragraf
+      // med den sammensatte tekst, og fjern de ekstra <a:r>-noder
+      xml = xml.replace(/(<a:p[ >][\s\S]*?<\/a:p>)/g, (paragraph) => {
+        // Saml al tekst fra <a:t> tags i denne paragraf
+        const texts = [];
+        const tRegex = /<a:t>([^<]*)<\/a:t>/g;
+        let m;
+        while ((m = tRegex.exec(paragraph)) !== null) {
+          texts.push({ match: m[0], text: m[1] });
+        }
 
-        // {{key}} format
-        const re1 = new RegExp(`\\{\\{${escapedKey}\\}\\}`, 'g');
-        if (re1.test(xml)) { xml = xml.replace(re1, replacement); changed = true; }
+        if (texts.length === 0) return paragraph;
 
-        // <key> format (kun hvis det ligner en placeholder, ikke HTML-tags)
-        const re2 = new RegExp(`<${escapedKey}>`, 'g');
-        if (re2.test(xml)) { xml = xml.replace(re2, replacement); changed = true; }
+        // Saml al tekst som én streng og tjek om den indeholder en placeholder
+        const combined = texts.map(t => t.text).join('');
+        if (!combined.includes('{{') && !combined.includes('<')) return paragraph;
+
+        // Erstat kendte placeholders i den samlede streng
+        let replaced = combined;
+        for (const [pattern, replacement] of Object.entries(lookup)) {
+          const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          replaced = replaced.replace(new RegExp(escaped, 'g'), replacement);
+        }
+
+        // Catch-all: fjern resterende {{...}} mønstre
+        replaced = replaced.replace(/\{\{[^}]+\}\}/g, '');
+
+        // Fjern "null" der står alene (ikke som del af et ord)
+        replaced = replaced.replace(/\bnull\b/g, '');
+
+        if (replaced === combined) return paragraph; // Ingen ændringer
+
+        // Skriv den erstattede tekst tilbage i første <a:t>
+        // og fjern de efterfølgende <a:r>-noder der nu er tomme
+        let firstReplaced = false;
+        let result = paragraph.replace(/<a:r>([\s\S]*?)<a:t>[^<]*<\/a:t>([\s\S]*?)<\/a:r>/g, (run, before, after) => {
+          if (!firstReplaced) {
+            firstReplaced = true;
+            return `<a:r>${before}<a:t>${replaced}</a:t>${after}</a:r>`;
+          }
+          // Bevar runs der ikke er del af placeholder-splittingen
+          // (fx runs med anden formatering)
+          return `<a:r>${before}<a:t></a:t>${after}</a:r>`;
+        });
+
+        changed = true;
+        return result;
+      });
+
+      // TRIN 2: Simpel string-replace for placeholders der ikke var splittede
+      for (const [pattern, replacement] of Object.entries(lookup)) {
+        const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(escaped, 'g');
+        if (re.test(xml)) {
+          xml = xml.replace(re, replacement);
+          changed = true;
+        }
       }
 
-      // 2) Catch-all: fjern alle tilbageværende {{...}} mønstre
+      // TRIN 3: Catch-all — fjern alle resterende {{...}}
       if (/\{\{[^}]+\}\}/.test(xml)) {
         xml = xml.replace(/\{\{[^}]+\}\}/g, '');
         changed = true;
       }
 
-      // 3) Erstat "null" der står alene som tekstindhold i en XML-celle
-      // Matcher >null< og >null < og lignende
-      if (/>[  ]*null[  ]*</.test(xml)) {
-        xml = xml.replace(/(?<=>[ ]*)null(?=[ ]*<)/g, '');
+      // TRIN 4: Fjern "null" der står alene som celleindhold
+      if (/>\s*null\s*</.test(xml)) {
+        xml = xml.replace(/(?<=>)\s*null\s*(?=<)/g, '');
         changed = true;
       }
 
