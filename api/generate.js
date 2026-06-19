@@ -49,14 +49,11 @@ function isEmpty(value) {
 function buildReplaceParams(placeholders) {
   const params = [];
   for (const [key, value] of Object.entries(placeholders)) {
-    if (isEmpty(value)) {
-      params.push({ replace: key,          by: { text: '' } });
-      params.push({ replace: `{{${key}}}`, by: { text: '' } });
-      continue;
-    }
     const arr = tryParseArray(value);
-    const text = arr ? arr.join('\n') : String(value);
-    params.push({ replace: key,          by: { text } });
+    const text = isEmpty(value) ? '' : (arr ? arr.join('\n') : String(value));
+
+    // Erstat KUN {{key}}-format for at undgå at ramme normale ord i brødtekst.
+    // Fx vil "domme", "total", "men" ellers slette ord i løbende tekst.
     params.push({ replace: `{{${key}}}`, by: { text } });
   }
   return params;
@@ -74,14 +71,15 @@ function cleanupResidualPlaceholders(pptxPath, placeholders) {
     const zip = new AdmZip(pptxPath);
     const entries = zip.getEntries();
 
-    // Byg en lookup: { "{{key}}": "value", "key": "value", ... }
+    // Byg en lookup — KUN med {{key}}-format.
+    // Rå nøgleord (fx "domme", "total", "men") kan optræde som normale ord
+    // i brødtekst og må ALDRIG erstattes uden markup rundt om sig.
     const lookup = {};
     for (const [key, value] of Object.entries(placeholders)) {
       const replacement = isEmpty(value)
         ? ''
         : String(tryParseArray(value) ? tryParseArray(value).join('\n') : value);
       lookup[`{{${key}}}`] = replacement;
-      lookup[key] = replacement;
     }
 
     for (const entry of entries) {
