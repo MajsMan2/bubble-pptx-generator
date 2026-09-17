@@ -390,8 +390,19 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    const arrayPlaceholders = {};
+    for (const [key, value] of Object.entries(placeholders)) {
+      if (isEmpty(value)) continue;
+      const arr = tryParseArray(value);
+      if (arr && arr.length > 1) {
+        arrayPlaceholders[key] = arr;
+      }
+    }
+
     // --- SKRIDT 2: FLET POWERPOINT VIA AUTOMIZER ---
-    if (Automizer && modify) {
+    // Keep the original PPTX when no table needs row expansion. This preserves
+    // tables, charts, and other unsupported PowerPoint elements exactly.
+    if (Automizer && modify && Object.keys(arrayPlaceholders).length > 0) {
       try {
         const automizer = new Automizer({
           templateDir: '/tmp',
@@ -408,15 +419,6 @@ module.exports = async function handler(req, res) {
 
         const replaceParams = buildReplaceParams(placeholders);
         const shapeModCb = modify.replaceText(replaceParams);
-
-        const arrayPlaceholders = {};
-        for (const [key, value] of Object.entries(placeholders)) {
-          if (isEmpty(value)) continue;
-          const arr = tryParseArray(value);
-          if (arr && arr.length > 1) {
-            arrayPlaceholders[key] = arr;
-          }
-        }
 
         for (const slide of slides) {
           pres.addSlide('base', slide.number, async (s) => {
