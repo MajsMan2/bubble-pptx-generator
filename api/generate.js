@@ -128,6 +128,7 @@ function replacePlaceholderInXml(xml, key, value) {
   const replacement = escapeXmlText(value);
   const tokenPattern = placeholderPattern(key);
   if (tokenPattern.test(xml)) {
+    tokenPattern.lastIndex = 0;
     return xml.replace(tokenPattern, () => replacement);
   }
 
@@ -152,23 +153,36 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
       xml = xml.replace(/<a:tbl(?:\s[^>]*)?>[\s\S]*?<\/a:tbl>/g, (tableXml) => {
         let updatedTable = tableXml;
 
-        for (const [key, values] of Object.entries(arrayPlaceholders)) {
-          const rowRegex = /<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g;
-          const rows = updatedTable.match(rowRegex) || [];
-          const templateRow = rows.find(row => {
-            const textOnlyRow = row.replace(/<[^>]+>/g, '');
-            return textOnlyRow.includes(`{{${key}}}`) || textOnlyRow.includes(key);
-          });
-          if (!templateRow) continue;
+        const arrayEntries = Object.entries(arrayPlaceholders);
+        const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
+        const templateRow = rows.find(row => {
+          const textOnlyRow = row
+            .replace(/<[^>]+>/g, '')
+            .replace(/\s+/g, '');
+          return arrayEntries.some(([key]) =>
+            textOnlyRow.includes(`{{${key}}}`) || textOnlyRow.includes(key)
+          );
+        });
 
-          const expandedRows = values.map(value => {
-            return replacePlaceholderInXml(templateRow, key, value);
-          }).join('');
+        if (!templateRow) return updatedTable;
 
-          updatedTable = updatedTable.replace(templateRow, expandedRows);
-          changed = true;
-          break;
-        }
+        const templateText = templateRow
+          .replace(/<[^>]+>/g, '')
+          .replace(/\s+/g, '');
+        const rowArrays = arrayEntries.filter(([key]) =>
+          templateText.includes(`{{${key}}}`) || templateText.includes(key)
+        );
+        if (rowArrays.length === 0) return updatedTable;
+
+        const rowCount = Math.max(...rowArrays.map(([, values]) => values.length));
+        const expandedRows = Array.from({ length: rowCount }, (_, index) => {
+          return rowArrays.reduce((row, [key, values]) => {
+            return replacePlaceholderInXml(row, key, values[index] ?? '');
+          }, templateRow);
+        }).join('');
+
+        updatedTable = updatedTable.replace(templateRow, expandedRows);
+        changed = true;
 
         return updatedTable;
       });
