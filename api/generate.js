@@ -112,6 +112,32 @@ function escapeXmlText(value) {
     .replace(/'/g, '&apos;');
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function placeholderPattern(key) {
+  const token = `{{${key}}}`;
+  return new RegExp(
+    Array.from(token).map(character => escapeRegExp(character)).join('(?:<[^>]+>)*'),
+    'g'
+  );
+}
+
+function replacePlaceholderInXml(xml, key, value) {
+  const replacement = escapeXmlText(value);
+  const tokenPattern = placeholderPattern(key);
+  if (tokenPattern.test(xml)) {
+    return xml.replace(tokenPattern, () => replacement);
+  }
+
+  const barePattern = new RegExp(
+    Array.from(String(key)).map(character => escapeRegExp(character)).join('(?:<[^>]+>)*'),
+    'g'
+  );
+  return xml.replace(barePattern, () => replacement);
+}
+
 function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
   if (Object.keys(arrayPlaceholders).length === 0) return;
 
@@ -129,14 +155,14 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
         for (const [key, values] of Object.entries(arrayPlaceholders)) {
           const rowRegex = /<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g;
           const rows = updatedTable.match(rowRegex) || [];
-          const templateRow = rows.find(row => row.includes(`{{${key}}}`) || row.includes(key));
+          const templateRow = rows.find(row => {
+            const textOnlyRow = row.replace(/<[^>]+>/g, '');
+            return textOnlyRow.includes(`{{${key}}}`) || textOnlyRow.includes(key);
+          });
           if (!templateRow) continue;
 
           const expandedRows = values.map(value => {
-            const escapedValue = escapeXmlText(value);
-            return templateRow
-              .replace(new RegExp(`\\{\\{${key.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\}\\}`, 'g'), escapedValue)
-              .replace(new RegExp(key.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&'), 'g'), escapedValue);
+            return replacePlaceholderInXml(templateRow, key, value);
           }).join('');
 
           updatedTable = updatedTable.replace(templateRow, expandedRows);
@@ -155,6 +181,43 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
     zip.writeZip(pptxPath);
   } catch (error) {
     console.error('Tabeludvidelse via XML fejlede:', error);
+  }
+}
+
+function cleanupResidualPlaceholders(pptxPath, placeholders) {
+  try {
+    const zip = new AdmZip(pptxPath);
+    const replacements = Object.entries(placeholders).map(([key, value]) => ({
+      pattern: placeholderPattern(key),
+      value: isEmpty(value)
+        ? ''
+        : escapeXmlText(tryParseArray(value)?.join('\n') ?? value)
+    }));
+
+    for (const entry of zip.getEntries()) {
+      if (!/^ppt\/slides\/slide\d+\.xml$/.test(entry.entryName)) continue;
+
+      let xml = entry.getData().toString('utf8');
+      let changed = false;
+
+      for (const replacement of replacements) {
+        const updatedXml = xml.replace(replacement.pattern, () => replacement.value);
+        if (updatedXml !== xml) changed = true;
+        xml = updatedXml;
+      }
+
+      const withoutUnknownPlaceholders = xml.replace(/\{\{[^}]+\}\}/g, '');
+      if (withoutUnknownPlaceholders !== xml) changed = true;
+      xml = withoutUnknownPlaceholders;
+
+      if (changed) {
+        zip.updateFile(entry.entryName, Buffer.from(xml, 'utf8'));
+      }
+    }
+
+    zip.writeZip(pptxPath);
+  } catch (error) {
+    console.error('Placeholder-cleanup fejlede:', error);
   }
 }
 
