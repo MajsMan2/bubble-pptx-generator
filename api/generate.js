@@ -59,6 +59,50 @@ function buildReplaceParams(placeholders) {
   return params;
 }
 
+function findXmlElement(root, names) {
+  if (!root || !root.elements) return null;
+  for (const element of root.elements) {
+    if (names.includes(element.name)) return element;
+    const found = findXmlElement(element, names);
+    if (found) return found;
+  }
+  return null;
+}
+
+function resizeExpandedTable(xmlData, rows) {
+  const table = findXmlElement(xmlData, ['a:tbl', 'tbl']);
+  const transform = findXmlElement(xmlData, ['a:xfrm', 'xfrm']);
+  if (!table || !transform || !table.elements || !transform.elements) return;
+
+  const rowHeights = rows
+    .map(row => Number(row.attributes?.h || row.attributes?.height || 0))
+    .filter(height => Number.isFinite(height) && height > 0);
+  if (rowHeights.length === 0) return;
+
+  const ext = transform.elements.find(element => element.name === 'a:ext' || element.name === 'ext');
+  const off = transform.elements.find(element => element.name === 'a:off' || element.name === 'off');
+  if (!ext || !ext.attributes) return;
+
+  const tableHeight = rowHeights.reduce((total, height) => total + height, 0);
+  const slideHeight = 5143500;
+  const top = Number(off?.attributes?.y || 0);
+  const availableHeight = Math.max(0, slideHeight - top);
+  const targetHeight = Math.min(tableHeight, availableHeight);
+  const scale = tableHeight > 0 ? targetHeight / tableHeight : 1;
+
+  if (scale < 1) {
+    for (const row of rows) {
+      const height = Number(row.attributes?.h || row.attributes?.height || 0);
+      if (!Number.isFinite(height) || height <= 0) continue;
+      const scaledHeight = String(Math.max(1, Math.round(height * scale)));
+      if (row.attributes.h !== undefined) row.attributes.h = scaledHeight;
+      else row.attributes.height = scaledHeight;
+    }
+  }
+
+  ext.attributes.cy = String(Math.round(targetHeight));
+}
+
 // --- POST-PROCESSING: XML-niveau cleanup ---
 // PPTX er en ZIP med XML-filer. PowerPoint splitter ofte tekst som
 // "{{farlig_genbrug_kg_tons}}" over flere <a:r>-noder, fx:
@@ -321,7 +365,7 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    const { template_url, placeholders, company_unique_id, company_name, delete_slides, delete_tables } = body;
+    const { template_url, placeholders, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
@@ -441,6 +485,7 @@ module.exports = async function handler(req, res) {
                           1,
                           ...newRows
                         );
+                        resizeExpandedTable(xmlData, newRows);
                       }
                     }
                   }
@@ -478,7 +523,10 @@ module.exports = async function handler(req, res) {
     // delete_slides: [1, 3, 5]  — 1-baserede slide-numre
     // delete_tables: ["tabel_affald", "tabel_bio"] — navne sat i PowerPoint
     const slidesToDelete = tryParseArray(delete_slides) || (Array.isArray(delete_slides) ? delete_slides : []);
-    const tablesToDelete = tryParseArray(delete_tables) || (Array.isArray(delete_tables) ? delete_tables : []);
+    // Table deletion is opt-in so an accidental delete_tables value cannot remove template tables.
+    const tablesToDelete = enable_table_deletion === true
+      ? (tryParseArray(delete_tables) || (Array.isArray(delete_tables) ? delete_tables : []))
+      : [];
     deleteSlides(outputPath, slidesToDelete);
     deleteTables(outputPath, tablesToDelete);
 
