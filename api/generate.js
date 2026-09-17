@@ -417,13 +417,8 @@ module.exports = async function handler(req, res) {
         const info = await pres.getInfo();
         const slides = info.slidesByTemplate('base');
 
-        const replaceParams = buildReplaceParams(placeholders);
-        const shapeModCb = modify.replaceText(replaceParams);
-
         for (const slide of slides) {
           pres.addSlide('base', slide.number, async (s) => {
-            const textElements = await s.getAllTextElementIds();
-
             let tableElements = [];
             try {
               if (typeof s.getAllElements === 'function') {
@@ -503,10 +498,6 @@ module.exports = async function handler(req, res) {
               // the text-only modifier, because it can remove table structure.
             }
 
-            const combinedElements = Array.from(new Set([...textElements]));
-            for (const element of combinedElements) {
-              s.modifyElement(element, shapeModCb);
-            }
           });
         }
 
