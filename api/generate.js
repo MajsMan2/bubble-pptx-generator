@@ -527,8 +527,8 @@ module.exports = async function handler(req, res) {
       const r = data.response ?? data;
       const candidates = [r, ...(Array.isArray(r) ? r : [])];
       for (const c of candidates) {
-        const raw = c?.sharedTo?.shareLink || c?.shareLink || c?.link || c?.url || "";
-        if (raw) return raw;
+        const raw = c?.sharedTo?.shareLink || c?.shareLink || c?.link || "";
+        if (raw && /\/s\/[^/?#]+/.test(raw) && !/^about:blank$/i.test(raw)) return raw;
       }
       return "";
     };
