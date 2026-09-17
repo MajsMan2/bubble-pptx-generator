@@ -36,6 +36,24 @@ function tryParseArray(value) {
   return null;
 }
 
+function tryParseList(value) {
+  const array = tryParseArray(value);
+  if (array) return array;
+  if (typeof value === 'string' && value.includes(',')) {
+    const values = value.split(',').map(item => item.trim()).filter(Boolean);
+    return values.length > 1 ? values : null;
+  }
+  return null;
+}
+
+function isNumericPlaceholder(key) {
+  return /(?:number|numeric|antal|count|total|amount|balance|revenue|price|cost|quantity|employees|employee|kg|co2|emission|sum|bel[oø]b|oms[aæ]tning|ansatte)/i.test(key);
+}
+
+function defaultPlaceholderValue(key, value) {
+  return isEmpty(value) && isNumericPlaceholder(key) ? 0 : value;
+}
+
 function isEmpty(value) {
   if (value === null || value === undefined) return true;
   const str = String(value).trim();
@@ -177,7 +195,11 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
         const rowCount = Math.max(...rowArrays.map(([, values]) => values.length));
         const expandedRows = Array.from({ length: rowCount }, (_, index) => {
           return rowArrays.reduce((row, [key, values]) => {
-            return replacePlaceholderInXml(row, key, values[index] ?? '');
+            return replacePlaceholderInXml(
+              row,
+              key,
+              defaultPlaceholderValue(key, values[index] ?? '')
+            );
           }, templateRow);
         }).join('');
 
@@ -204,7 +226,7 @@ function cleanupResidualPlaceholders(pptxPath, placeholders) {
     const replacements = Object.entries(placeholders).map(([key, value]) => ({
       pattern: placeholderPattern(key),
       value: isEmpty(value)
-        ? ''
+        ? defaultPlaceholderValue(key, value)
         : escapeXmlText(tryParseArray(value)?.join('\n') ?? value)
     }));
 
@@ -220,7 +242,9 @@ function cleanupResidualPlaceholders(pptxPath, placeholders) {
         xml = updatedXml;
       }
 
-      const withoutUnknownPlaceholders = xml.replace(/\{\{[^}]+\}\}/g, '');
+      const withoutUnknownPlaceholders = xml.replace(/\{\{([^}]+)\}\}/g, (match, key) => (
+        isNumericPlaceholder(key) ? '0' : ''
+      ));
       if (withoutUnknownPlaceholders !== xml) changed = true;
       xml = withoutUnknownPlaceholders;
 
@@ -413,7 +437,7 @@ module.exports = async function handler(req, res) {
     const arrayPlaceholders = {};
     for (const [key, value] of Object.entries(placeholders)) {
       if (isEmpty(value)) continue;
-      const arr = tryParseArray(value);
+      const arr = tryParseList(value);
       if (arr && arr.length > 1) {
         arrayPlaceholders[key] = arr;
       }
