@@ -46,12 +46,15 @@ function tryParseList(value) {
   return null;
 }
 
-function isNumericPlaceholder(key) {
-  return /(?:number|numeric|antal|count|total|amount|balance|revenue|price|cost|quantity|employees|employee|kg|co2|emission|sum|bel[oø]b|oms[aæ]tning|ansatte)/i.test(key);
+function isNumericValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value !== 'string') return false;
+  return value.trim() !== '' && Number.isFinite(Number(value));
 }
 
-function defaultPlaceholderValue(key, value) {
-  return isEmpty(value) && isNumericPlaceholder(key) ? 0 : value;
+function defaultPlaceholderValue(key, value, numericKeys) {
+  if (!isEmpty(value)) return value;
+  return numericKeys.has(key) ? 0 : '';
 }
 
 function isEmpty(value) {
@@ -195,11 +198,7 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
         const rowCount = Math.max(...rowArrays.map(([, values]) => values.length));
         const expandedRows = Array.from({ length: rowCount }, (_, index) => {
           return rowArrays.reduce((row, [key, values]) => {
-            return replacePlaceholderInXml(
-              row,
-              key,
-              defaultPlaceholderValue(key, values[index] ?? '')
-            );
+            return replacePlaceholderInXml(row, key, values[index] ?? '');
           }, templateRow);
         }).join('');
 
@@ -220,14 +219,14 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
   }
 }
 
-function cleanupResidualPlaceholders(pptxPath, placeholders) {
+function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
   try {
     const zip = new AdmZip(pptxPath);
     const replacements = Object.entries(placeholders).map(([key, value]) => ({
       pattern: placeholderPattern(key),
       value: isEmpty(value)
-        ? defaultPlaceholderValue(key, value)
-        : escapeXmlText(tryParseArray(value)?.join('\n') ?? value)
+        ? defaultPlaceholderValue(key, value, numericKeys)
+        : escapeXmlText(tryParseList(value)?.join('\n') ?? value)
     }));
 
     for (const entry of zip.getEntries()) {
@@ -242,9 +241,7 @@ function cleanupResidualPlaceholders(pptxPath, placeholders) {
         xml = updatedXml;
       }
 
-      const withoutUnknownPlaceholders = xml.replace(/\{\{([^}]+)\}\}/g, (match, key) => (
-        isNumericPlaceholder(key) ? '0' : ''
-      ));
+      const withoutUnknownPlaceholders = xml.replace(/\{\{[^}]+\}\}/g, '');
       if (withoutUnknownPlaceholders !== xml) changed = true;
       xml = withoutUnknownPlaceholders;
 
@@ -435,11 +432,15 @@ module.exports = async function handler(req, res) {
     }
 
     const arrayPlaceholders = {};
+    const numericKeys = new Set();
     for (const [key, value] of Object.entries(placeholders)) {
       if (isEmpty(value)) continue;
       const arr = tryParseList(value);
       if (arr && arr.length > 1) {
         arrayPlaceholders[key] = arr;
+        if (arr.some(isNumericValue)) numericKeys.add(key);
+      } else if (isNumericValue(value)) {
+        numericKeys.add(key);
       }
     }
 
@@ -558,7 +559,7 @@ module.exports = async function handler(req, res) {
 
     // --- SKRIDT 2.5: XML-NIVEAU CLEANUP ---
     // Fjerner alle tilbageværende {{...}} og "null"-værdier direkte i PPTX-XML
-    cleanupResidualPlaceholders(outputPath, placeholders);
+    cleanupResidualPlaceholders(outputPath, placeholders, numericKeys);
 
     // --- SKRIDT 2.6: SLET SLIDES OG TABELLER ---
     // delete_slides: [1, 3, 5]  — 1-baserede slide-numre
