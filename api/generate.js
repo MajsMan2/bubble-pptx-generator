@@ -37,13 +37,22 @@ function tryParseArray(value) {
 }
 
 function tryParseList(value) {
-  const array = tryParseArray(value);
-  if (array) return array;
-  if (typeof value === 'string' && value.includes(',')) {
-    const values = value.split(',').map(item => item.trim()).filter(Boolean);
-    return values.length > 1 ? values : null;
+  return tryParseArray(value);
+}
+
+function buildPlaceholdersFromRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+
+  const keys = new Set();
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    Object.keys(row).forEach(key => keys.add(key));
   }
-  return null;
+
+  if (keys.size === 0) return null;
+  return Object.fromEntries(
+    [...keys].map(key => [key, rows.map(row => row?.[key] ?? '')])
+  );
 }
 
 function isNumericValue(value) {
@@ -406,7 +415,8 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    const { template_url, placeholders, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
+    const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
+    const placeholders = buildPlaceholdersFromRows(rows) || requestPlaceholders;
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
