@@ -485,7 +485,8 @@ module.exports = async function handler(req, res) {
                           1,
                           ...newRows
                         );
-                        resizeExpandedTable(xmlData, newRows);
+                        const allRows = tblEl.elements.filter(el => el.name === 'a:tr' || el.name === 'tr');
+                        resizeExpandedTable(xmlData, allRows);
                       }
                     }
                   }
@@ -496,7 +497,8 @@ module.exports = async function handler(req, res) {
                 console.error(`Fejl ved tabelmanipulation af ${tableName}:`, tableModError);
               }
 
-              s.modifyElement(tableName, shapeModCb);
+              // Table XML is modified above. Do not pass the entire table through
+              // the text-only modifier, because it can remove table structure.
             }
 
             const combinedElements = Array.from(new Set([...textElements]));
@@ -523,10 +525,8 @@ module.exports = async function handler(req, res) {
     // delete_slides: [1, 3, 5]  — 1-baserede slide-numre
     // delete_tables: ["tabel_affald", "tabel_bio"] — navne sat i PowerPoint
     const slidesToDelete = tryParseArray(delete_slides) || (Array.isArray(delete_slides) ? delete_slides : []);
-    // Table deletion is opt-in so an accidental delete_tables value cannot remove template tables.
-    const tablesToDelete = enable_table_deletion === true
-      ? (tryParseArray(delete_tables) || (Array.isArray(delete_tables) ? delete_tables : []))
-      : [];
+    // Tables must be preserved; table deletion is disabled for this generator.
+    const tablesToDelete = [];
     deleteSlides(outputPath, slidesToDelete);
     deleteTables(outputPath, tablesToDelete);
 
