@@ -40,6 +40,10 @@ function tryParseList(value) {
   return tryParseArray(value);
 }
 
+function normalizeRows(rows) {
+  return tryParseArray(rows);
+}
+
 function buildPlaceholdersFromRows(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return null;
 
@@ -51,7 +55,15 @@ function buildPlaceholdersFromRows(rows) {
 
   if (keys.size === 0) return null;
   return Object.fromEntries(
-    [...keys].map(key => [key, rows.map(row => row?.[key] ?? '')])
+    [...keys].map(key => {
+      const values = rows.map(row => row?.[key] ?? '');
+      const meaningfulValues = values.filter(value => !isEmpty(value));
+      const hasOneRepeatedValue = meaningfulValues.length > 1 && meaningfulValues.every(
+        value => String(value).trim() === String(meaningfulValues[0]).trim()
+      );
+
+      return [key, hasOneRepeatedValue ? [meaningfulValues[0]] : values];
+    })
   );
 }
 
@@ -169,7 +181,13 @@ function replacePlaceholderInXml(xml, key, value) {
   return xml.replace(barePattern, () => replacement);
 }
 
-function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
+function expandArrayTablesInXml(pptxPath, placeholders) {
+  const arrayPlaceholders = Object.fromEntries(
+    Object.entries(placeholders).filter(([, value]) => {
+      const values = tryParseList(value);
+      return values && values.length > 1;
+    })
+  );
   if (Object.keys(arrayPlaceholders).length === 0) return;
 
   try {
@@ -184,6 +202,10 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
         let updatedTable = tableXml;
 
         const arrayEntries = Object.entries(arrayPlaceholders);
+        const placeholderEntries = Object.entries(placeholders).map(([key, value]) => {
+          const values = tryParseList(value);
+          return [key, values || [value]];
+        });
         const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
         const templateRow = rows.find(row => {
           const textOnlyRow = row
@@ -206,8 +228,9 @@ function expandArrayTablesInXml(pptxPath, arrayPlaceholders) {
 
         const rowCount = Math.max(...rowArrays.map(([, values]) => values.length));
         const expandedRows = Array.from({ length: rowCount }, (_, index) => {
-          return rowArrays.reduce((row, [key, values]) => {
-            return replacePlaceholderInXml(row, key, values[index] ?? '');
+          return placeholderEntries.reduce((row, [key, values]) => {
+            const value = values[index] ?? '';
+            return replacePlaceholderInXml(row, key, value);
           }, templateRow);
         }).join('');
 
@@ -416,7 +439,8 @@ module.exports = async function handler(req, res) {
     }
 
     const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
-    const placeholders = buildPlaceholdersFromRows(rows) || requestPlaceholders;
+    const normalizedRows = normalizeRows(rows);
+    const placeholders = buildPlaceholdersFromRows(normalizedRows) || requestPlaceholders;
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
@@ -565,7 +589,7 @@ module.exports = async function handler(req, res) {
       fs.copyFileSync(templatePath, outputPath);
     }
 
-    expandArrayTablesInXml(outputPath, arrayPlaceholders);
+    expandArrayTablesInXml(outputPath, placeholders);
 
     // --- SKRIDT 2.5: XML-NIVEAU CLEANUP ---
     // Fjerner alle tilbageværende {{...}} og "null"-værdier direkte i PPTX-XML
