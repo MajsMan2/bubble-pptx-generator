@@ -36,6 +36,21 @@ function tryParseArray(value) {
   return null;
 }
 
+function tryParseObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{')) return null;
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 function tryParseList(value) {
   return tryParseArray(value);
 }
@@ -494,8 +509,9 @@ module.exports = async function handler(req, res) {
 
     const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
     const normalizedRows = normalizeRows(rows);
+    const parsedPlaceholders = tryParseObject(requestPlaceholders);
     const placeholders = buildPlaceholdersFromRows(normalizedRows)
-      || normalizeDelimitedPlaceholders(requestPlaceholders);
+      || normalizeDelimitedPlaceholders(parsedPlaceholders);
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
