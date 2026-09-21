@@ -22,33 +22,31 @@ function safeFilename(name) {
   return String(name).replace(/[^a-zA-Z0-9æøåÆØÅ\-_]/g, '_').substring(0, 60);
 }
 
-function tryParseArray(value) {
-  if (Array.isArray(value)) return value;
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (trimmed.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (Array.isArray(parsed)) return parsed;
-      } catch (e) {}
+function parseJsonValue(value) {
+  let parsed = value;
+
+  for (let attempt = 0; attempt < 3 && typeof parsed === 'string'; attempt++) {
+    const trimmed = parsed.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) break;
+
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (e) {
+      break;
     }
   }
-  return null;
+
+  return parsed;
+}
+
+function tryParseArray(value) {
+  const parsed = parseJsonValue(value);
+  return Array.isArray(parsed) ? parsed : null;
 }
 
 function tryParseObject(value) {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
-  if (typeof value !== 'string') return null;
-
-  const trimmed = value.trim();
-  if (!trimmed.startsWith('{')) return null;
-
-  try {
-    const parsed = JSON.parse(trimmed);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-  } catch (e) {
-    return null;
-  }
+  const parsed = parseJsonValue(value);
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
 }
 
 function tryParseList(value) {
@@ -63,29 +61,42 @@ function splitDelimitedValue(value) {
   return values;
 }
 
+function findSharedDelimitedCount(entries) {
+  const counts = new Map();
+  for (const [, values] of entries) {
+    counts.set(values.length, (counts.get(values.length) || 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .filter(([count, columnCount]) => count > 1 && columnCount > 1)
+    .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? null;
+}
+
+function expandDelimitedObject(object) {
+  if (!object || typeof object !== 'object' || Array.isArray(object)) return null;
+
+  const entries = Object.entries(object);
+  const delimitedEntries = entries
+    .map(([key, value]) => [key, splitDelimitedValue(value)])
+    .filter(([, values]) => values);
+  const sharedCount = findSharedDelimitedCount(delimitedEntries);
+
+  if (!sharedCount) return null;
+
+  return Array.from({ length: sharedCount }, (_, index) => Object.fromEntries(
+    entries.map(([key, value]) => {
+      const values = splitDelimitedValue(value);
+      return [key, values?.length === sharedCount ? values[index] : value];
+    })
+  ));
+}
+
 function expandDelimitedRows(rows) {
   if (!Array.isArray(rows)) return rows;
 
   return rows.flatMap(row => {
     if (!row || typeof row !== 'object' || Array.isArray(row)) return [row];
-
-    const candidates = Object.entries(row)
-      .map(([key, value]) => [key, splitDelimitedValue(value)])
-      .filter(([, values]) => values);
-    const counts = new Map();
-    candidates.forEach(([, values]) => counts.set(values.length, (counts.get(values.length) || 0) + 1));
-    const sharedCount = [...counts.entries()]
-      .filter(([count, columnCount]) => count > 1 && columnCount > 1)
-      .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0];
-
-    if (!sharedCount) return [row];
-
-    return Array.from({ length: sharedCount }, (_, index) => Object.fromEntries(
-      Object.entries(row).map(([key, value]) => {
-        const values = splitDelimitedValue(value);
-        return [key, values?.length === sharedCount ? values[index] : value];
-      })
-    ));
+    return expandDelimitedObject(row) || [row];
   });
 }
 
@@ -95,22 +106,15 @@ function normalizeRows(rows) {
 
 function normalizeDelimitedPlaceholders(placeholders) {
   if (!placeholders || typeof placeholders !== 'object') return placeholders;
+  const expandedRows = expandDelimitedObject(placeholders);
+  if (!expandedRows) return placeholders;
 
-  const candidates = Object.entries(placeholders)
-    .map(([key, value]) => [key, splitDelimitedValue(value)])
-    .filter(([, values]) => values);
-  const counts = new Map();
-  candidates.forEach(([, values]) => counts.set(values.length, (counts.get(values.length) || 0) + 1));
-  const sharedCount = [...counts.entries()]
-    .filter(([count, columnCount]) => count > 1 && columnCount > 1)
-    .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0];
-
-  if (!sharedCount) return placeholders;
-
-  return Object.fromEntries(Object.entries(placeholders).map(([key, value]) => {
-    const values = splitDelimitedValue(value);
-    return [key, values?.length === sharedCount ? values : value];
-  }));
+  return Object.fromEntries(Object.keys(placeholders).map(key => [
+    key,
+    splitDelimitedValue(placeholders[key])?.length === expandedRows.length
+      ? expandedRows.map(row => row[key])
+      : placeholders[key]
+  ]));
 }
 
 function buildPlaceholdersFromRows(rows) {
