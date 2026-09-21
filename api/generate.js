@@ -27,10 +27,10 @@ function parseJsonValue(value) {
 
   for (let attempt = 0; attempt < 3 && typeof parsed === 'string'; attempt++) {
     const trimmed = parsed.trim();
-    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) break;
-
     try {
-      parsed = JSON.parse(trimmed);
+      const nextValue = JSON.parse(trimmed);
+      if (nextValue === parsed) break;
+      parsed = nextValue;
     } catch (e) {
       break;
     }
