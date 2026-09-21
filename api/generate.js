@@ -40,8 +40,42 @@ function tryParseList(value) {
   return tryParseArray(value);
 }
 
+function splitDelimitedValue(value) {
+  if (typeof value !== 'string' || !value.includes(',')) return null;
+
+  const values = value.split(',').map(item => item.trim());
+  if (values.length < 2 || values.some(item => item === '')) return null;
+  return values;
+}
+
+function expandDelimitedRows(rows) {
+  if (!Array.isArray(rows)) return rows;
+
+  return rows.flatMap(row => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return [row];
+
+    const candidates = Object.entries(row)
+      .map(([key, value]) => [key, splitDelimitedValue(value)])
+      .filter(([, values]) => values);
+    const counts = new Map();
+    candidates.forEach(([, values]) => counts.set(values.length, (counts.get(values.length) || 0) + 1));
+    const sharedCount = [...counts.entries()]
+      .filter(([count, columnCount]) => count > 1 && columnCount > 1)
+      .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0];
+
+    if (!sharedCount) return [row];
+
+    return Array.from({ length: sharedCount }, (_, index) => Object.fromEntries(
+      Object.entries(row).map(([key, value]) => {
+        const values = splitDelimitedValue(value);
+        return [key, values?.length === sharedCount ? values[index] : value];
+      })
+    ));
+  });
+}
+
 function normalizeRows(rows) {
-  return tryParseArray(rows);
+  return expandDelimitedRows(tryParseArray(rows));
 }
 
 function buildPlaceholdersFromRows(rows) {
