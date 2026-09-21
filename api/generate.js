@@ -78,6 +78,26 @@ function normalizeRows(rows) {
   return expandDelimitedRows(tryParseArray(rows));
 }
 
+function normalizeDelimitedPlaceholders(placeholders) {
+  if (!placeholders || typeof placeholders !== 'object') return placeholders;
+
+  const candidates = Object.entries(placeholders)
+    .map(([key, value]) => [key, splitDelimitedValue(value)])
+    .filter(([, values]) => values);
+  const counts = new Map();
+  candidates.forEach(([, values]) => counts.set(values.length, (counts.get(values.length) || 0) + 1));
+  const sharedCount = [...counts.entries()]
+    .filter(([count, columnCount]) => count > 1 && columnCount > 1)
+    .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0];
+
+  if (!sharedCount) return placeholders;
+
+  return Object.fromEntries(Object.entries(placeholders).map(([key, value]) => {
+    const values = splitDelimitedValue(value);
+    return [key, values?.length === sharedCount ? values : value];
+  }));
+}
+
 function buildPlaceholdersFromRows(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return null;
 
@@ -474,7 +494,8 @@ module.exports = async function handler(req, res) {
 
     const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
     const normalizedRows = normalizeRows(rows);
-    const placeholders = buildPlaceholdersFromRows(normalizedRows) || requestPlaceholders;
+    const placeholders = buildPlaceholdersFromRows(normalizedRows)
+      || normalizeDelimitedPlaceholders(requestPlaceholders);
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
