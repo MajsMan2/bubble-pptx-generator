@@ -61,6 +61,12 @@ function splitDelimitedValue(value) {
   return values;
 }
 
+function getListValue(value) {
+  const parsed = tryParseList(value);
+  if (parsed && parsed.length > 1) return parsed.map(item => String(item ?? '').trim());
+  return splitDelimitedValue(value);
+}
+
 function findSharedDelimitedCount(entries) {
   const counts = new Map();
   for (const [, values] of entries) {
@@ -77,7 +83,7 @@ function expandDelimitedObject(object) {
 
   const entries = Object.entries(object);
   const delimitedEntries = entries
-    .map(([key, value]) => [key, splitDelimitedValue(value)])
+    .map(([key, value]) => [key, getListValue(value)])
     .filter(([, values]) => values);
   const sharedCount = findSharedDelimitedCount(delimitedEntries);
 
@@ -85,7 +91,7 @@ function expandDelimitedObject(object) {
 
   return Array.from({ length: sharedCount }, (_, index) => Object.fromEntries(
     entries.map(([key, value]) => {
-      const values = splitDelimitedValue(value);
+      const values = getListValue(value);
       return [key, values?.length === sharedCount ? values[index] : value];
     })
   ));
@@ -111,7 +117,7 @@ function normalizeDelimitedPlaceholders(placeholders) {
 
   return Object.fromEntries(Object.keys(placeholders).map(key => [
     key,
-    splitDelimitedValue(placeholders[key])?.length === expandedRows.length
+    getListValue(placeholders[key])?.length === expandedRows.length
       ? expandedRows.map(row => row[key])
       : placeholders[key]
   ]));
@@ -254,6 +260,12 @@ function replacePlaceholderInXml(xml, key, value) {
   return xml.replace(barePattern, () => replacement);
 }
 
+function rowContainsPlaceholder(rowXml, key) {
+  const text = rowXml.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
+  const normalizedKey = String(key).replace(/\s+/g, '');
+  return text.includes(`{{${normalizedKey}}}`) || text.includes(normalizedKey);
+}
+
 function expandArrayTablesInXml(pptxPath, placeholders) {
   const arrayPlaceholders = Object.fromEntries(
     Object.entries(placeholders).filter(([, value]) => {
@@ -280,29 +292,23 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
           return [key, values || [value]];
         });
         const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
-        const templateRow = rows.find(row => {
-          const textOnlyRow = row
-            .replace(/<[^>]+>/g, '')
-            .replace(/\s+/g, '');
-          return arrayEntries.some(([key]) =>
-            textOnlyRow.includes(`{{${key}}}`) || textOnlyRow.includes(key)
-          );
-        });
+        const templateRow = rows.find(row =>
+          arrayEntries.some(([key]) => rowContainsPlaceholder(row, key))
+        );
 
         if (!templateRow) return updatedTable;
 
-        const templateText = templateRow
-          .replace(/<[^>]+>/g, '')
-          .replace(/\s+/g, '');
         const rowArrays = arrayEntries.filter(([key]) =>
-          templateText.includes(`{{${key}}}`) || templateText.includes(key)
+          rowContainsPlaceholder(templateRow, key)
         );
         if (rowArrays.length === 0) return updatedTable;
 
         const rowCount = Math.max(...rowArrays.map(([, values]) => values.length));
         const expandedRows = Array.from({ length: rowCount }, (_, index) => {
           return placeholderEntries.reduce((row, [key, values]) => {
-            const value = values[index] ?? '';
+            const value = values.length === 1
+              ? (index === 0 ? values[0] : '')
+              : (values[index] ?? '');
             return replacePlaceholderInXml(row, key, value);
           }, templateRow);
         }).join('');
