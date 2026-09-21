@@ -513,9 +513,11 @@ module.exports = async function handler(req, res) {
 
     const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
     const normalizedRows = normalizeRows(rows);
-    const parsedPlaceholders = tryParseObject(requestPlaceholders);
+    const parsedPlaceholderValue = parseJsonValue(requestPlaceholders);
+    const placeholderRows = normalizeRows(parsedPlaceholderValue);
     const placeholders = buildPlaceholdersFromRows(normalizedRows)
-      || normalizeDelimitedPlaceholders(parsedPlaceholders);
+      || buildPlaceholdersFromRows(placeholderRows)
+      || normalizeDelimitedPlaceholders(tryParseObject(parsedPlaceholderValue));
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
