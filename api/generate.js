@@ -330,6 +330,136 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
   }
 }
 
+// --- UDVID RÆKKER MED FLERE KOMMASEPAREREDE KOLONNER I SAMME RÆKKE ---
+// Kigger på den FÆRDIGE tekst i hver tabelcelle (dvs. efter placeholders er
+// erstattet). Hvis mere end 1 kolonne i samme række indeholder en
+// kommasepareret liste, og listerne har samme antal værdier, oprettes der
+// en ny række pr. værdi, og værdierne fordeles ned i de nye rækker.
+// Kolonner der IKKE er en del af den matchende gruppe gentages uændret i
+// hver ny række (fx en label-/kategori-kolonne).
+//
+// Bemærk: danske tal skrives ofte med komma som decimalseparator
+// (fx "1.234,56"). Sådanne værdier springes over, så de ikke fejlagtigt
+// bliver splittet op.
+
+function looksLikeDecimalNumber(text) {
+  const trimmed = String(text).trim();
+  // fx "1234,56" eller "1.234,56" eller "-12,3"
+  return /^-?\d{1,3}(\.\d{3})*,\d+$/.test(trimmed) || /^-?\d+,\d+$/.test(trimmed);
+}
+
+function splitCellCommaValues(text) {
+  if (typeof text !== 'string' || !text.includes(',')) return null;
+  if (looksLikeDecimalNumber(text)) return null;
+
+  const values = text.split(',').map(item => item.trim());
+  if (values.length < 2 || values.some(item => item === '')) return null;
+  if (values.some(looksLikeDecimalNumber) === false && values.every(v => v === '')) return null;
+  return values;
+}
+
+function getCellPlainText(cellXml) {
+  const matches = cellXml.match(/<a:t>([\s\S]*?)<\/a:t>/g) || [];
+  return matches
+    .map(match => match.replace(/^<a:t>/, '').replace(/<\/a:t>$/, ''))
+    .join('');
+}
+
+function setCellPlainText(cellXml, newText) {
+  let isFirst = true;
+  return cellXml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, () => {
+    if (isFirst) {
+      isFirst = false;
+      return `<a:t>${escapeXmlText(newText)}</a:t>`;
+    }
+    // Yderligere text-runs i samme celle tømmes, så værdien ikke gentages.
+    return `<a:t></a:t>`;
+  });
+}
+
+function findSharedSplitLength(cellSplits) {
+  const counts = new Map();
+  for (const { values } of cellSplits) {
+    counts.set(values.length, (counts.get(values.length) || 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .filter(([length, columnCount]) => columnCount > 1)
+    .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? null;
+}
+
+function expandCommaRow(rowXml) {
+  const cellMatches = [...rowXml.matchAll(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>/g)].map(m => m[0]);
+  if (cellMatches.length < 2) return null;
+
+  const cellSplits = cellMatches
+    .map((cellXml, index) => {
+      const text = getCellPlainText(cellXml);
+      const values = splitCellCommaValues(text);
+      return values ? { index, values } : null;
+    })
+    .filter(Boolean);
+
+  if (cellSplits.length < 2) return null;
+
+  const sharedLength = findSharedSplitLength(cellSplits);
+  if (!sharedLength) return null;
+
+  const matchingEntries = cellSplits.filter(entry => entry.values.length === sharedLength);
+  if (matchingEntries.length < 2) return null;
+
+  const newRows = [];
+  for (let i = 0; i < sharedLength; i++) {
+    let newRow = rowXml;
+    for (const entry of matchingEntries) {
+      const oldCellXml = cellMatches[entry.index];
+      const newCellXml = setCellPlainText(oldCellXml, entry.values[i]);
+      newRow = newRow.replace(oldCellXml, newCellXml);
+    }
+    newRows.push(newRow);
+  }
+
+  return newRows.join('');
+}
+
+function expandCommaSeparatedTableRows(pptxPath) {
+  try {
+    const zip = new AdmZip(pptxPath);
+    let anyChanged = false;
+
+    for (const entry of zip.getEntries()) {
+      if (!/^ppt\/slides\/slide\d+\.xml$/.test(entry.entryName)) continue;
+
+      let xml = entry.getData().toString('utf8');
+      let changed = false;
+
+      xml = xml.replace(/<a:tbl(?:\s[^>]*)?>[\s\S]*?<\/a:tbl>/g, (tableXml) => {
+        let updatedTable = tableXml;
+        const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
+
+        for (const row of rows) {
+          const expandedRow = expandCommaRow(row);
+          if (expandedRow) {
+            updatedTable = updatedTable.replace(row, expandedRow);
+            changed = true;
+          }
+        }
+
+        return updatedTable;
+      });
+
+      if (changed) {
+        zip.updateFile(entry.entryName, Buffer.from(xml, 'utf8'));
+        anyChanged = true;
+      }
+    }
+
+    if (anyChanged) zip.writeZip(pptxPath);
+  } catch (error) {
+    console.error('Udvidelse af kommaseparerede kolonner fejlede:', error);
+  }
+}
+
 function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
   try {
     const zip = new AdmZip(pptxPath);
@@ -678,7 +808,13 @@ module.exports = async function handler(req, res) {
     // Fjerner alle tilbageværende {{...}} og "null"-værdier direkte i PPTX-XML
     cleanupResidualPlaceholders(outputPath, placeholders, numericKeys);
 
-    // --- SKRIDT 2.6: SLET SLIDES OG TABELLER ---
+    // --- SKRIDT 2.6: UDVID RÆKKER MED FLERE KOMMASEPAREREDE KOLONNER ---
+    // Kører EFTER placeholder-substitution, så den ser den færdige tekst i
+    // hver celle. Hvis flere kolonner i samme række har lige mange
+    // kommaseparerede værdier, laves der ekstra rækker.
+    expandCommaSeparatedTableRows(outputPath);
+
+    // --- SKRIDT 2.7: SLET SLIDES OG TABELLER ---
     // delete_slides: [1, 3, 5]  — 1-baserede slide-numre
     // delete_tables: ["tabel_affald", "tabel_bio"] — navne sat i PowerPoint
     const slidesToDelete = tryParseArray(delete_slides) || (Array.isArray(delete_slides) ? delete_slides : []);
