@@ -330,13 +330,18 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
   }
 }
 
-// --- UDVID RÆKKER MED FLERE KOMMASEPAREREDE KOLONNER I SAMME RÆKKE ---
+// --- UDVID RÆKKER MED KOMMASEPAREREDE VÆRDIER I SAMME RÆKKE ---
 // Kigger på den FÆRDIGE tekst i hver tabelcelle (dvs. efter placeholders er
-// erstattet). Hvis mere end 1 kolonne i samme række indeholder en
-// kommasepareret liste, og listerne har samme antal værdier, oprettes der
-// en ny række pr. værdi, og værdierne fordeles ned i de nye rækker.
-// Kolonner der IKKE er en del af den matchende gruppe gentages uændret i
-// hver ny række (fx en label-/kategori-kolonne).
+// erstattet). To tilfælde håndteres:
+//   1) Flere kolonner i samme række har hver en kommasepareret liste med
+//      SAMME antal værdier — der laves en ny række pr. værdi, og værdierne
+//      fordeles parallelt ned i de nye rækker.
+//   2) Kun ÉN kolonne har en kommasepareret liste, men den består af et
+//      lige antal rene tal (fx GPS-koordinater skrevet fladt som
+//      "lat, long, lat, long, ..."). Her tolkes tallene parvist som
+//      (lat, long) og der laves én ny række pr. koordinatsæt.
+// I begge tilfælde gentages kolonner der ikke indgår i udvidelsen (fx en
+// adresse- eller label-kolonne) uændret i hver ny række.
 //
 // Bemærk: danske tal skrives ofte med komma som decimalseparator
 // (fx "1.234,56"). Sådanne værdier springes over, så de ikke fejlagtigt
@@ -388,9 +393,44 @@ function findSharedSplitLength(cellSplits) {
     .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? null;
 }
 
+// En enkelt celle kan indeholde flere koordinatsæt (lat, long) skrevet som
+// en flad, kommasepareret liste, fx:
+// "8.4766811 , 55.5099661, 55.5694909 , 9.7335522, ..."
+// Hvis alle værdier i listen er rene decimaltal (punktum som decimalseparator)
+// og der er et lige antal af dem, tolkes de parvist som (lat, long) og
+// samles til fx "8.4766811 , 55.5099661" pr. nyt koordinatsæt/række.
+function isPlainFloat(value) {
+  return /^-?\d+(\.\d+)?$/.test(String(value).trim());
+}
+
+function groupIntoCoordinatePairs(values) {
+  if (values.length < 4 || values.length % 2 !== 0) return null;
+  if (!values.every(isPlainFloat)) return null;
+
+  const pairs = [];
+  for (let i = 0; i < values.length; i += 2) {
+    pairs.push(`${values[i]} , ${values[i + 1]}`);
+  }
+  return pairs;
+}
+
+function buildExpandedRows(rowXml, cellMatches, entries, count) {
+  const newRows = [];
+  for (let i = 0; i < count; i++) {
+    let newRow = rowXml;
+    for (const entry of entries) {
+      const oldCellXml = cellMatches[entry.index];
+      const newCellXml = setCellPlainText(oldCellXml, entry.values[i]);
+      newRow = newRow.replace(oldCellXml, newCellXml);
+    }
+    newRows.push(newRow);
+  }
+  return newRows.join('');
+}
+
 function expandCommaRow(rowXml) {
   const cellMatches = [...rowXml.matchAll(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>/g)].map(m => m[0]);
-  if (cellMatches.length < 2) return null;
+  if (cellMatches.length === 0) return null;
 
   const cellSplits = cellMatches
     .map((cellXml, index) => {
@@ -400,26 +440,31 @@ function expandCommaRow(rowXml) {
     })
     .filter(Boolean);
 
-  if (cellSplits.length < 2) return null;
+  if (cellSplits.length === 0) return null;
 
-  const sharedLength = findSharedSplitLength(cellSplits);
-  if (!sharedLength) return null;
-
-  const matchingEntries = cellSplits.filter(entry => entry.values.length === sharedLength);
-  if (matchingEntries.length < 2) return null;
-
-  const newRows = [];
-  for (let i = 0; i < sharedLength; i++) {
-    let newRow = rowXml;
-    for (const entry of matchingEntries) {
-      const oldCellXml = cellMatches[entry.index];
-      const newCellXml = setCellPlainText(oldCellXml, entry.values[i]);
-      newRow = newRow.replace(oldCellXml, newCellXml);
+  // Forsøg 1: mere end 1 kolonne i rækken har samme antal kommaseparerede
+  // værdier — fordel værdierne parallelt ned i nye rækker.
+  if (cellSplits.length >= 2) {
+    const sharedLength = findSharedSplitLength(cellSplits);
+    if (sharedLength) {
+      const matchingEntries = cellSplits.filter(entry => entry.values.length === sharedLength);
+      if (matchingEntries.length >= 2) {
+        return buildExpandedRows(rowXml, cellMatches, matchingEntries, sharedLength);
+      }
     }
-    newRows.push(newRow);
   }
 
-  return newRows.join('');
+  // Forsøg 2: kun 1 kolonne har en kommasepareret liste, men den består af
+  // et lige antal rene tal — fortolk som koordinatpar (lat, long) og lav en
+  // ny række pr. par. De øvrige celler i rækken gentages uændret.
+  for (const entry of cellSplits) {
+    const pairs = groupIntoCoordinatePairs(entry.values);
+    if (pairs) {
+      return buildExpandedRows(rowXml, cellMatches, [{ index: entry.index, values: pairs }], pairs.length);
+    }
+  }
+
+  return null;
 }
 
 function expandCommaSeparatedTableRows(pptxPath) {
