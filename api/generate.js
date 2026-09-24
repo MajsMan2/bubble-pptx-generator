@@ -266,12 +266,48 @@ function rowContainsPlaceholder(rowXml, key) {
   return text.includes(`{{${normalizedKey}}}`) || text.includes(normalizedKey);
 }
 
+// --- FIND LISTE-VÆRDIER I EN ENKELT PLACEHOLDER-VÆRDI ---
+// Understøtter to former:
+//   1) Et rigtigt JSON-array (fx fra "rows"-baserede payloads).
+//   2) En flad, kommasepareret streng, hvor der skelnes mellem to
+//      kommastile:
+//        - "4, 4"  (komma UDEN mellemrum foran) = adskiller to
+//          selvstændige værdier.
+//        - "4 , 4" (komma MED mellemrum foran) = hører sammen med
+//          værdien selv (fx for at holde et koordinatpar
+//          "lat , long" samlet som ÉN værdi).
+// Bemærk: danske tal skrives ofte med komma som decimalseparator
+// (fx "1.234,56"). Sådanne værdier tolkes IKKE som en liste.
+function looksLikeDecimalNumber(text) {
+  const trimmed = String(text).trim();
+  // fx "1234,56" eller "1.234,56" eller "-12,3"
+  return /^-?\d{1,3}(\.\d{3})*,\d+$/.test(trimmed) || /^-?\d+,\d+$/.test(trimmed);
+}
+
+function getPlaceholderListValues(value) {
+  const jsonArray = tryParseList(value);
+  if (jsonArray && jsonArray.length > 1) {
+    return jsonArray.map(item => String(item ?? ''));
+  }
+
+  if (typeof value !== 'string' || !value.includes(',')) return null;
+  if (looksLikeDecimalNumber(value)) return null;
+
+  // Split KUN på et komma der ikke har et mellemrum lige foran sig.
+  const values = value.split(/(?<! ),\s*/).map(item => item.trim());
+  if (values.length < 2 || values.some(item => item === '')) return null;
+  return values;
+}
+
+// Denne funktion rører KUN rækker, der indeholder et {{placeholder}} fra
+// requesten (via rowContainsPlaceholder). Statisk skabelontekst (fx
+// overskrifter og forklarende sætninger med almindelige kommaer) har ingen
+// {{...}}-token og bliver derfor aldrig splittet op.
 function expandArrayTablesInXml(pptxPath, placeholders) {
   const arrayPlaceholders = Object.fromEntries(
-    Object.entries(placeholders).filter(([, value]) => {
-      const values = tryParseList(value);
-      return values && values.length > 1;
-    })
+    Object.entries(placeholders)
+      .map(([key, value]) => [key, getPlaceholderListValues(value)])
+      .filter(([, values]) => values && values.length > 1)
   );
   if (Object.keys(arrayPlaceholders).length === 0) return;
 
@@ -288,8 +324,8 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
 
         const arrayEntries = Object.entries(arrayPlaceholders);
         const placeholderEntries = Object.entries(placeholders).map(([key, value]) => {
-          const values = tryParseList(value);
-          return [key, values || [value]];
+          const values = getPlaceholderListValues(value);
+          return [key, values && values.length > 1 ? values : [value]];
         });
         const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
         const templateRow = rows.find(row =>
@@ -306,9 +342,10 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
         const rowCount = Math.max(...rowArrays.map(([, values]) => values.length));
         const expandedRows = Array.from({ length: rowCount }, (_, index) => {
           return placeholderEntries.reduce((row, [key, values]) => {
-            const value = values.length === 1
-              ? (index === 0 ? values[0] : '')
-              : (values[index] ?? '');
+            // Kolonner der ikke selv er en liste (values.length === 1)
+            // gentages uændret på hver ny række, fx en adresse- eller
+            // label-kolonne der hører til hele gruppen af nye rækker.
+            const value = values.length === 1 ? values[0] : (values[index] ?? '');
             return replacePlaceholderInXml(row, key, value);
           }, templateRow);
         }).join('');
@@ -330,166 +367,6 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
   }
 }
 
-// --- UDVID RÆKKER MED KOMMASEPAREREDE VÆRDIER I SAMME RÆKKE ---
-// Kigger på den FÆRDIGE tekst i hver tabelcelle (dvs. efter placeholders er
-// erstattet). Der skelnes mellem to kommastile i selve teksten:
-//   - "4, 4"  (komma UDEN mellemrum foran) = adskiller to selvstændige
-//     værdier — det er HER der skal splittes til nye rækker.
-//   - "4 , 4" (komma MED mellemrum foran) = hører sammen med værdien selv,
-//     fx for at holde et koordinatpar "lat , long" samlet som ÉN værdi.
-// To tilfælde håndteres:
-//   1) Flere kolonner i samme række har hver en liste med SAMME antal
-//      værdier — der laves en ny række pr. værdi, og værdierne fordeles
-//      parallelt ned i de nye rækker.
-//   2) Kun ÉN kolonne har en liste — der laves én ny række pr. værdi i den
-//      liste, og de øvrige kolonner i rækken gentages uændret.
-//
-// Bemærk: danske tal skrives ofte med komma som decimalseparator
-// (fx "1.234,56"). Sådanne værdier springes over, så de ikke fejlagtigt
-// bliver splittet op.
-
-function looksLikeDecimalNumber(text) {
-  const trimmed = String(text).trim();
-  // fx "1234,56" eller "1.234,56" eller "-12,3"
-  return /^-?\d{1,3}(\.\d{3})*,\d+$/.test(trimmed) || /^-?\d+,\d+$/.test(trimmed);
-}
-
-function splitCellCommaValues(text) {
-  if (typeof text !== 'string' || !text.includes(',')) return null;
-  if (looksLikeDecimalNumber(text)) return null;
-
-  // Split KUN på et komma der ikke har et mellemrum lige foran sig.
-  // Et komma MED mellemrum foran ("4 , 4") bevares som en del af værdien.
-  const values = text
-    .split(/(?<! ),\s*/)
-    .map(item => item.trim());
-
-  if (values.length < 2 || values.some(item => item === '')) return null;
-  return values;
-}
-
-function getCellPlainText(cellXml) {
-  const matches = cellXml.match(/<a:t>([\s\S]*?)<\/a:t>/g) || [];
-  return matches
-    .map(match => match.replace(/^<a:t>/, '').replace(/<\/a:t>$/, ''))
-    .join('');
-}
-
-function setCellPlainText(cellXml, newText) {
-  let isFirst = true;
-  return cellXml.replace(/<a:t>([\s\S]*?)<\/a:t>/g, () => {
-    if (isFirst) {
-      isFirst = false;
-      return `<a:t>${escapeXmlText(newText)}</a:t>`;
-    }
-    // Yderligere text-runs i samme celle tømmes, så værdien ikke gentages.
-    return `<a:t></a:t>`;
-  });
-}
-
-function findSharedSplitLength(cellSplits) {
-  const counts = new Map();
-  for (const { values } of cellSplits) {
-    counts.set(values.length, (counts.get(values.length) || 0) + 1);
-  }
-
-  return [...counts.entries()]
-    .filter(([length, columnCount]) => columnCount > 1)
-    .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? null;
-}
-
-function buildExpandedRows(rowXml, cellMatches, entries, count) {
-  const newRows = [];
-  for (let i = 0; i < count; i++) {
-    let newRow = rowXml;
-    for (const entry of entries) {
-      const oldCellXml = cellMatches[entry.index];
-      const newCellXml = setCellPlainText(oldCellXml, entry.values[i]);
-      newRow = newRow.replace(oldCellXml, newCellXml);
-    }
-    newRows.push(newRow);
-  }
-  return newRows.join('');
-}
-
-function expandCommaRow(rowXml) {
-  const cellMatches = [...rowXml.matchAll(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>/g)].map(m => m[0]);
-  if (cellMatches.length === 0) return null;
-
-  const cellSplits = cellMatches
-    .map((cellXml, index) => {
-      const text = getCellPlainText(cellXml);
-      const values = splitCellCommaValues(text);
-      return values ? { index, values } : null;
-    })
-    .filter(Boolean);
-
-  if (cellSplits.length === 0) return null;
-
-  // Forsøg 1: mere end 1 kolonne i rækken har samme antal værdier — fordel
-  // værdierne parallelt ned i nye rækker.
-  if (cellSplits.length >= 2) {
-    const sharedLength = findSharedSplitLength(cellSplits);
-    if (sharedLength) {
-      const matchingEntries = cellSplits.filter(entry => entry.values.length === sharedLength);
-      if (matchingEntries.length >= 2) {
-        return buildExpandedRows(rowXml, cellMatches, matchingEntries, sharedLength);
-      }
-    }
-  }
-
-  // Forsøg 2: kun 1 kolonne har en liste (fx en flad koordinatliste, hvor
-  // hvert koordinatsæt allerede er holdt samlet af " , " frem for ", ").
-  // Brug den kolonne med flest værdier, og gentag resten af rækken uændret.
-  const bestSingleColumn = cellSplits.reduce((best, entry) =>
-    !best || entry.values.length > best.values.length ? entry : best
-  , null);
-
-  if (bestSingleColumn) {
-    return buildExpandedRows(rowXml, cellMatches, [bestSingleColumn], bestSingleColumn.values.length);
-  }
-
-  return null;
-}
-
-function expandCommaSeparatedTableRows(pptxPath) {
-  try {
-    const zip = new AdmZip(pptxPath);
-    let anyChanged = false;
-
-    for (const entry of zip.getEntries()) {
-      if (!/^ppt\/slides\/slide\d+\.xml$/.test(entry.entryName)) continue;
-
-      let xml = entry.getData().toString('utf8');
-      let changed = false;
-
-      xml = xml.replace(/<a:tbl(?:\s[^>]*)?>[\s\S]*?<\/a:tbl>/g, (tableXml) => {
-        let updatedTable = tableXml;
-        const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
-
-        for (const row of rows) {
-          const expandedRow = expandCommaRow(row);
-          if (expandedRow) {
-            updatedTable = updatedTable.replace(row, expandedRow);
-            changed = true;
-          }
-        }
-
-        return updatedTable;
-      });
-
-      if (changed) {
-        zip.updateFile(entry.entryName, Buffer.from(xml, 'utf8'));
-        anyChanged = true;
-      }
-    }
-
-    if (anyChanged) zip.writeZip(pptxPath);
-  } catch (error) {
-    console.error('Udvidelse af kommaseparerede kolonner fejlede:', error);
-  }
-}
-
 function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
   try {
     const zip = new AdmZip(pptxPath);
@@ -497,7 +374,7 @@ function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
       pattern: placeholderPattern(key),
       value: isEmpty(value)
         ? defaultPlaceholderValue(key, value, numericKeys)
-        : escapeXmlText(tryParseList(value)?.join('\n') ?? value)
+        : escapeXmlText(getPlaceholderListValues(value)?.join('\n') ?? value)
     }));
 
     for (const entry of zip.getEntries()) {
@@ -712,7 +589,7 @@ module.exports = async function handler(req, res) {
     const numericKeys = new Set();
     for (const [key, value] of Object.entries(placeholders)) {
       if (isEmpty(value)) continue;
-      const arr = tryParseList(value);
+      const arr = getPlaceholderListValues(value);
       if (arr && arr.length > 1) {
         arrayPlaceholders[key] = arr;
         if (arr.some(isNumericValue)) numericKeys.add(key);
@@ -838,13 +715,7 @@ module.exports = async function handler(req, res) {
     // Fjerner alle tilbageværende {{...}} og "null"-værdier direkte i PPTX-XML
     cleanupResidualPlaceholders(outputPath, placeholders, numericKeys);
 
-    // --- SKRIDT 2.6: UDVID RÆKKER MED FLERE KOMMASEPAREREDE KOLONNER ---
-    // Kører EFTER placeholder-substitution, så den ser den færdige tekst i
-    // hver celle. Hvis flere kolonner i samme række har lige mange
-    // kommaseparerede værdier, laves der ekstra rækker.
-    expandCommaSeparatedTableRows(outputPath);
-
-    // --- SKRIDT 2.7: SLET SLIDES OG TABELLER ---
+    // --- SKRIDT 2.6: SLET SLIDES OG TABELLER ---
     // delete_slides: [1, 3, 5]  — 1-baserede slide-numre
     // delete_tables: ["tabel_affald", "tabel_bio"] — navne sat i PowerPoint
     const slidesToDelete = tryParseArray(delete_slides) || (Array.isArray(delete_slides) ? delete_slides : []);
