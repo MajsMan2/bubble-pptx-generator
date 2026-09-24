@@ -332,16 +332,17 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
 
 // --- UDVID RÆKKER MED KOMMASEPAREREDE VÆRDIER I SAMME RÆKKE ---
 // Kigger på den FÆRDIGE tekst i hver tabelcelle (dvs. efter placeholders er
-// erstattet). To tilfælde håndteres:
-//   1) Flere kolonner i samme række har hver en kommasepareret liste med
-//      SAMME antal værdier — der laves en ny række pr. værdi, og værdierne
-//      fordeles parallelt ned i de nye rækker.
-//   2) Kun ÉN kolonne har en kommasepareret liste, men den består af et
-//      lige antal rene tal (fx GPS-koordinater skrevet fladt som
-//      "lat, long, lat, long, ..."). Her tolkes tallene parvist som
-//      (lat, long) og der laves én ny række pr. koordinatsæt.
-// I begge tilfælde gentages kolonner der ikke indgår i udvidelsen (fx en
-// adresse- eller label-kolonne) uændret i hver ny række.
+// erstattet). Der skelnes mellem to kommastile i selve teksten:
+//   - "4, 4"  (komma UDEN mellemrum foran) = adskiller to selvstændige
+//     værdier — det er HER der skal splittes til nye rækker.
+//   - "4 , 4" (komma MED mellemrum foran) = hører sammen med værdien selv,
+//     fx for at holde et koordinatpar "lat , long" samlet som ÉN værdi.
+// To tilfælde håndteres:
+//   1) Flere kolonner i samme række har hver en liste med SAMME antal
+//      værdier — der laves en ny række pr. værdi, og værdierne fordeles
+//      parallelt ned i de nye rækker.
+//   2) Kun ÉN kolonne har en liste — der laves én ny række pr. værdi i den
+//      liste, og de øvrige kolonner i rækken gentages uændret.
 //
 // Bemærk: danske tal skrives ofte med komma som decimalseparator
 // (fx "1.234,56"). Sådanne værdier springes over, så de ikke fejlagtigt
@@ -357,9 +358,13 @@ function splitCellCommaValues(text) {
   if (typeof text !== 'string' || !text.includes(',')) return null;
   if (looksLikeDecimalNumber(text)) return null;
 
-  const values = text.split(',').map(item => item.trim());
+  // Split KUN på et komma der ikke har et mellemrum lige foran sig.
+  // Et komma MED mellemrum foran ("4 , 4") bevares som en del af værdien.
+  const values = text
+    .split(/(?<! ),\s*/)
+    .map(item => item.trim());
+
   if (values.length < 2 || values.some(item => item === '')) return null;
-  if (values.some(looksLikeDecimalNumber) === false && values.every(v => v === '')) return null;
   return values;
 }
 
@@ -393,27 +398,6 @@ function findSharedSplitLength(cellSplits) {
     .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? null;
 }
 
-// En enkelt celle kan indeholde flere koordinatsæt (lat, long) skrevet som
-// en flad, kommasepareret liste, fx:
-// "8.4766811 , 55.5099661, 55.5694909 , 9.7335522, ..."
-// Hvis alle værdier i listen er rene decimaltal (punktum som decimalseparator)
-// og der er et lige antal af dem, tolkes de parvist som (lat, long) og
-// samles til fx "8.4766811 , 55.5099661" pr. nyt koordinatsæt/række.
-function isPlainFloat(value) {
-  return /^-?\d+(\.\d+)?$/.test(String(value).trim());
-}
-
-function groupIntoCoordinatePairs(values) {
-  if (values.length < 4 || values.length % 2 !== 0) return null;
-  if (!values.every(isPlainFloat)) return null;
-
-  const pairs = [];
-  for (let i = 0; i < values.length; i += 2) {
-    pairs.push(`${values[i]} , ${values[i + 1]}`);
-  }
-  return pairs;
-}
-
 function buildExpandedRows(rowXml, cellMatches, entries, count) {
   const newRows = [];
   for (let i = 0; i < count; i++) {
@@ -442,8 +426,8 @@ function expandCommaRow(rowXml) {
 
   if (cellSplits.length === 0) return null;
 
-  // Forsøg 1: mere end 1 kolonne i rækken har samme antal kommaseparerede
-  // værdier — fordel værdierne parallelt ned i nye rækker.
+  // Forsøg 1: mere end 1 kolonne i rækken har samme antal værdier — fordel
+  // værdierne parallelt ned i nye rækker.
   if (cellSplits.length >= 2) {
     const sharedLength = findSharedSplitLength(cellSplits);
     if (sharedLength) {
@@ -454,14 +438,15 @@ function expandCommaRow(rowXml) {
     }
   }
 
-  // Forsøg 2: kun 1 kolonne har en kommasepareret liste, men den består af
-  // et lige antal rene tal — fortolk som koordinatpar (lat, long) og lav en
-  // ny række pr. par. De øvrige celler i rækken gentages uændret.
-  for (const entry of cellSplits) {
-    const pairs = groupIntoCoordinatePairs(entry.values);
-    if (pairs) {
-      return buildExpandedRows(rowXml, cellMatches, [{ index: entry.index, values: pairs }], pairs.length);
-    }
+  // Forsøg 2: kun 1 kolonne har en liste (fx en flad koordinatliste, hvor
+  // hvert koordinatsæt allerede er holdt samlet af " , " frem for ", ").
+  // Brug den kolonne med flest værdier, og gentag resten af rækken uændret.
+  const bestSingleColumn = cellSplits.reduce((best, entry) =>
+    !best || entry.values.length > best.values.length ? entry : best
+  , null);
+
+  if (bestSingleColumn) {
+    return buildExpandedRows(rowXml, cellMatches, [bestSingleColumn], bestSingleColumn.values.length);
   }
 
   return null;
