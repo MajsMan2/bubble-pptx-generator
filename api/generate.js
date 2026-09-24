@@ -299,16 +299,63 @@ function getPlaceholderListValues(value) {
   return values;
 }
 
+// En rå placeholder-værdi viser BEVIDST listestruktur (og kan derfor bruges
+// alene, uden en matchende søsterkolonne), hvis den enten:
+//   - allerede er et rigtigt JSON-array, eller
+//   - indeholder " ," (mellemrum FØR komma), som bruges til at holde en
+//     sammensat værdi samlet (fx et koordinatpar "lat , long").
+// Almindelig løbende tekst med helt normale kommaer ("tekst, mere tekst")
+// rammer ALDRIG dette mønster og udløser derfor ikke en ekspansion alene.
+function hasIntentionalListSignal(rawValue) {
+  if (Array.isArray(tryParseList(rawValue))) return true;
+  return typeof rawValue === 'string' && / ,/.test(rawValue);
+}
+
+// Afgør hvilke af de liste-agtige placeholders i EN OG SAMME række der skal
+// bruges til at ekspandere rækken, og hvor mange nye rækker der skal laves.
+//   1) Hvis 2 eller flere af kolonnerne har PRÆCIS samme antal værdier,
+//      bruges de sammen (stærkeste signal om en tilsigtet tabel-liste).
+//   2) Ellers bruges KUN én enkelt kolonne alene, og kun hvis dens rå værdi
+//      har det bevidste listesignal (se hasIntentionalListSignal).
+// Returnerer null hvis ingen af delene er opfyldt — rækken røres da IKKE.
+function findMatchingArrayGroup(rowArrayEntries) {
+  const counts = new Map();
+  for (const [, values] of rowArrayEntries) {
+    counts.set(values.length, (counts.get(values.length) || 0) + 1);
+  }
+  const shared = [...counts.entries()]
+    .filter(([, columnCount]) => columnCount > 1)
+    .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0];
+
+  if (shared) {
+    const sharedLength = shared[0];
+    const keys = new Set(
+      rowArrayEntries.filter(([, values]) => values.length === sharedLength).map(([key]) => key)
+    );
+    return { length: sharedLength, keys };
+  }
+
+  const signalled = rowArrayEntries.filter(([, , rawValue]) => hasIntentionalListSignal(rawValue));
+  if (signalled.length > 0) {
+    const best = signalled.reduce((a, b) => (b[1].length > a[1].length ? b : a));
+    return { length: best[1].length, keys: new Set([best[0]]) };
+  }
+
+  return null;
+}
+
 // Denne funktion rører KUN rækker, der indeholder et {{placeholder}} fra
 // requesten (via rowContainsPlaceholder). Statisk skabelontekst (fx
 // overskrifter og forklarende sætninger med almindelige kommaer) har ingen
 // {{...}}-token og bliver derfor aldrig splittet op.
 function expandArrayTablesInXml(pptxPath, placeholders) {
-  const arrayPlaceholders = Object.fromEntries(
-    Object.entries(placeholders)
-      .map(([key, value]) => [key, getPlaceholderListValues(value)])
-      .filter(([, values]) => values && values.length > 1)
-  );
+  const arrayPlaceholders = {};
+  for (const [key, value] of Object.entries(placeholders)) {
+    const values = getPlaceholderListValues(value);
+    if (values && values.length > 1) {
+      arrayPlaceholders[key] = { values, rawValue: value };
+    }
+  }
   if (Object.keys(arrayPlaceholders).length === 0) return;
 
   try {
@@ -322,30 +369,39 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
       xml = xml.replace(/<a:tbl(?:\s[^>]*)?>[\s\S]*?<\/a:tbl>/g, (tableXml) => {
         let updatedTable = tableXml;
 
-        const arrayEntries = Object.entries(arrayPlaceholders);
         const placeholderEntries = Object.entries(placeholders).map(([key, value]) => {
-          const values = getPlaceholderListValues(value);
-          return [key, values && values.length > 1 ? values : [value]];
+          const info = arrayPlaceholders[key];
+          return [key, info ? info.values : [value]];
         });
+
         const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
-        const templateRow = rows.find(row =>
-          arrayEntries.some(([key]) => rowContainsPlaceholder(row, key))
-        );
 
-        if (!templateRow) return updatedTable;
+        let templateRow = null;
+        let group = null;
+        for (const row of rows) {
+          const rowArrayEntries = Object.entries(arrayPlaceholders)
+            .filter(([key]) => rowContainsPlaceholder(row, key))
+            .map(([key, info]) => [key, info.values, info.rawValue]);
+          if (rowArrayEntries.length === 0) continue;
 
-        const rowArrays = arrayEntries.filter(([key]) =>
-          rowContainsPlaceholder(templateRow, key)
-        );
-        if (rowArrays.length === 0) return updatedTable;
+          const candidateGroup = findMatchingArrayGroup(rowArrayEntries);
+          if (candidateGroup) {
+            templateRow = row;
+            group = candidateGroup;
+            break;
+          }
+        }
 
-        const rowCount = Math.max(...rowArrays.map(([, values]) => values.length));
-        const expandedRows = Array.from({ length: rowCount }, (_, index) => {
+        if (!templateRow || !group) return updatedTable;
+
+        const expandedRows = Array.from({ length: group.length }, (_, index) => {
           return placeholderEntries.reduce((row, [key, values]) => {
-            // Kolonner der ikke selv er en liste (values.length === 1)
+            // Kolonner der ikke selv indgår i den matchende gruppe
             // gentages uændret på hver ny række, fx en adresse- eller
             // label-kolonne der hører til hele gruppen af nye rækker.
-            const value = values.length === 1 ? values[0] : (values[index] ?? '');
+            const value = group.keys.has(key)
+              ? (values[index] ?? '')
+              : (values.length === 1 ? values[0] : (values[index] ?? ''));
             return replacePlaceholderInXml(row, key, value);
           }, templateRow);
         }).join('');
