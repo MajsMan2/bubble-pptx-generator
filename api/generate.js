@@ -79,19 +79,33 @@ function splitOnSeparators(value, separatorRegex) {
     .map(item => item.split(PROTECT).join(',').trim());
 }
 
-function splitDelimitedValue(value) {
-  if (typeof value !== 'string' || !value.includes(',')) return null;
-  if (looksLikeDecimalNumber(value)) return null;
+// Koordinater skrevet som "55.3412 N, 10.0187 E" (uden mellemrum før komma)
+// bliver splittet til to enkeltdele ved komma. Er delene skiftevis en
+// breddegrad (N/S) og en længdegrad (E/W/Ø/V), samles de igen til ÉT
+// koordinatpar, så ét par aldrig tæller som to værdier.
+const COORD_NUM = '[-+]?\\d+(?:\\.\\d+)?';
+const COORD_LAT = new RegExp(`^${COORD_NUM}\\s*°?\\s*[NS]$`, 'i');
+const COORD_LON = new RegExp(`^${COORD_NUM}\\s*°?\\s*[EWØV]$`, 'i');
 
-  const values = splitOnSeparators(value, /,/);
-  if (values.length < 2 || values.some(item => item === '')) return null;
-  return values;
+function groupCoordinateTokens(values) {
+  if (values.length < 2 || values.length % 2 !== 0) return values;
+  const isPairs = values.every((item, index) =>
+    (index % 2 === 0 ? COORD_LAT : COORD_LON).test(String(item).trim())
+  );
+  if (!isPairs) return values;
+
+  const grouped = [];
+  for (let index = 0; index < values.length; index += 2) {
+    grouped.push(`${String(values[index]).trim()}, ${String(values[index + 1]).trim()}`);
+  }
+  return grouped;
 }
 
+// Én fælles regel for ALLE stier (placeholders-objekt, rows, tabeller):
+// se getPlaceholderListValues.
 function getListValue(value) {
-  const parsed = tryParseList(value);
-  if (parsed && parsed.length > 1) return parsed.map(item => String(item ?? '').trim());
-  return splitDelimitedValue(value);
+  const values = getPlaceholderListValues(value);
+  return values ? values.map(item => String(item ?? '').trim()) : null;
 }
 
 function findSharedDelimitedCount(entries) {
@@ -308,7 +322,8 @@ function rowContainsPlaceholder(rowXml, key) {
 function getPlaceholderListValues(value) {
   const jsonArray = tryParseList(value);
   if (jsonArray && jsonArray.length > 1) {
-    return jsonArray.map(item => String(item ?? ''));
+    const items = groupCoordinateTokens(jsonArray.map(item => String(item ?? '')));
+    return items.length > 1 ? items : null;
   }
 
   if (typeof value !== 'string' || !value.includes(',')) return null;
@@ -316,7 +331,7 @@ function getPlaceholderListValues(value) {
 
   // Split KUN på et komma der ikke har et mellemrum lige foran sig,
   // og som ikke er en tusindtalsseparator (beskyttes i splitOnSeparators).
-  const values = splitOnSeparators(value, /(?<! ),\s*/);
+  const values = groupCoordinateTokens(splitOnSeparators(value, /(?<! ),\s*/));
   if (values.length < 2 || values.some(item => item === '')) return null;
   return values;
 }
@@ -438,7 +453,7 @@ function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
             // (fx et koordinatpar "55.3 N, 10.0 E") bevares som ÉN værdi.
             const jsonList = tryParseList(value);
             return jsonList && jsonList.length > 1
-              ? jsonList.map(item => String(item ?? '')).join('\n')
+              ? groupCoordinateTokens(jsonList.map(item => String(item ?? ''))).join('\n')
               : value;
           })())
     }));
