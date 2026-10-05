@@ -53,10 +53,37 @@ function tryParseList(value) {
   return tryParseArray(value);
 }
 
+// --- TAL-FORMATER (må ALDRIG splittes som lister) ---
+// Genkender:
+//   - Dansk format:   "1234,56", "1.234,56", "-12,3"
+//   - Engelsk format: "1,020.0", "10,004.4", "1,364.4", "2,275.7"
+function looksLikeDecimalNumber(text) {
+  const trimmed = String(text).trim();
+  return (
+    /^-?\d{1,3}(\.\d{3})*,\d+$/.test(trimmed) ||      // 1.234,56
+    /^-?\d+,\d+$/.test(trimmed) ||                    // 1234,56
+    /^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(trimmed)     // 1,234.5 / 10,004.4
+  );
+}
+
+// Splitter en streng på separator-kommaer, men BESKYTTER kommaer der er
+// tusindtalsseparatorer: et helt tal (1-3 cifre, uden decimalpunktum foran)
+// efterfulgt af komma + præcis 3 cifre, fx "10,004.4" eller "1,020.0".
+// Koordinater som "55.1 , 10.2,155.1 , 10.2" rammes ikke, fordi tallet
+// foran kommaet har et decimalpunktum.
+function splitOnSeparators(value, separatorRegex) {
+  const PROTECT = '\u0001';
+  const protectedValue = String(value).replace(/(?<=(?<![\d.])\d{1,3}(?:,\d{3})*),(?=\d{3}(?!\d))/g, PROTECT);
+  return protectedValue
+    .split(separatorRegex)
+    .map(item => item.split(PROTECT).join(',').trim());
+}
+
 function splitDelimitedValue(value) {
   if (typeof value !== 'string' || !value.includes(',')) return null;
+  if (looksLikeDecimalNumber(value)) return null;
 
-  const values = value.split(',').map(item => item.trim());
+  const values = splitOnSeparators(value, /,/);
   if (values.length < 2 || values.some(item => item === '')) return null;
   return values;
 }
@@ -276,14 +303,8 @@ function rowContainsPlaceholder(rowXml, key) {
 //        - "4 , 4" (komma MED mellemrum foran) = hører sammen med
 //          værdien selv (fx for at holde et koordinatpar
 //          "lat , long" samlet som ÉN værdi).
-// Bemærk: danske tal skrives ofte med komma som decimalseparator
-// (fx "1.234,56"). Sådanne værdier tolkes IKKE som en liste.
-function looksLikeDecimalNumber(text) {
-  const trimmed = String(text).trim();
-  // fx "1234,56" eller "1.234,56" eller "-12,3"
-  return /^-?\d{1,3}(\.\d{3})*,\d+$/.test(trimmed) || /^-?\d+,\d+$/.test(trimmed);
-}
-
+// Tal med tusindtalsseparator ("10,004.4", "1,020.0") og danske decimaltal
+// ("1.234,56") tolkes IKKE som en liste.
 function getPlaceholderListValues(value) {
   const jsonArray = tryParseList(value);
   if (jsonArray && jsonArray.length > 1) {
@@ -293,8 +314,9 @@ function getPlaceholderListValues(value) {
   if (typeof value !== 'string' || !value.includes(',')) return null;
   if (looksLikeDecimalNumber(value)) return null;
 
-  // Split KUN på et komma der ikke har et mellemrum lige foran sig.
-  const values = value.split(/(?<! ),\s*/).map(item => item.trim());
+  // Split KUN på et komma der ikke har et mellemrum lige foran sig,
+  // og som ikke er en tusindtalsseparator (beskyttes i splitOnSeparators).
+  const values = splitOnSeparators(value, /(?<! ),\s*/);
   if (values.length < 2 || values.some(item => item === '')) return null;
   return values;
 }
