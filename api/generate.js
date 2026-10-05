@@ -321,25 +321,14 @@ function getPlaceholderListValues(value) {
   return values;
 }
 
-// En rå placeholder-værdi viser BEVIDST listestruktur (og kan derfor bruges
-// alene, uden en matchende søsterkolonne), hvis den enten:
-//   - allerede er et rigtigt JSON-array, eller
-//   - indeholder " ," (mellemrum FØR komma), som bruges til at holde en
-//     sammensat værdi samlet (fx et koordinatpar "lat , long").
-// Almindelig løbende tekst med helt normale kommaer ("tekst, mere tekst")
-// rammer ALDRIG dette mønster og udløser derfor ikke en ekspansion alene.
-function hasIntentionalListSignal(rawValue) {
-  if (Array.isArray(tryParseList(rawValue))) return true;
-  return typeof rawValue === 'string' && / ,/.test(rawValue);
-}
-
 // Afgør hvilke af de liste-agtige placeholders i EN OG SAMME række der skal
 // bruges til at ekspandere rækken, og hvor mange nye rækker der skal laves.
-//   1) Hvis 2 eller flere af kolonnerne har PRÆCIS samme antal værdier,
-//      bruges de sammen (stærkeste signal om en tilsigtet tabel-liste).
-//   2) Ellers bruges KUN én enkelt kolonne alene, og kun hvis dens rå værdi
-//      har det bevidste listesignal (se hasIntentionalListSignal).
-// Returnerer null hvis ingen af delene er opfyldt — rækken røres da IKKE.
+//
+// REGEL: En række udvides KUN, hvis mindst 2 kolonner har PRÆCIS samme antal
+// værdier (fx Sted, Adresse og Geolokation hos 3 lokationer). En enkelt
+// kolonne med flere værdier (fx ét koordinatpar "55.3 N, 10.0 E" i en tabel
+// hvor de andre kolonner kun har én værdi) udvider ALDRIG tabellen alene.
+// Returnerer null hvis reglen ikke er opfyldt — rækken røres da IKKE.
 function findMatchingArrayGroup(rowArrayEntries) {
   const counts = new Map();
   for (const [, values] of rowArrayEntries) {
@@ -349,21 +338,13 @@ function findMatchingArrayGroup(rowArrayEntries) {
     .filter(([, columnCount]) => columnCount > 1)
     .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0];
 
-  if (shared) {
-    const sharedLength = shared[0];
-    const keys = new Set(
-      rowArrayEntries.filter(([, values]) => values.length === sharedLength).map(([key]) => key)
-    );
-    return { length: sharedLength, keys };
-  }
+  if (!shared) return null;
 
-  const signalled = rowArrayEntries.filter(([, , rawValue]) => hasIntentionalListSignal(rawValue));
-  if (signalled.length > 0) {
-    const best = signalled.reduce((a, b) => (b[1].length > a[1].length ? b : a));
-    return { length: best[1].length, keys: new Set([best[0]]) };
-  }
-
-  return null;
+  const sharedLength = shared[0];
+  const keys = new Set(
+    rowArrayEntries.filter(([, values]) => values.length === sharedLength).map(([key]) => key)
+  );
+  return { length: sharedLength, keys };
 }
 
 // Denne funktion rører KUN rækker, der indeholder et {{placeholder}} fra
@@ -452,7 +433,14 @@ function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
       pattern: placeholderPattern(key),
       value: isEmpty(value)
         ? defaultPlaceholderValue(key, value, numericKeys)
-        : escapeXmlText(getPlaceholderListValues(value)?.join('\n') ?? value)
+        : escapeXmlText((() => {
+            // Kun rigtige JSON-arrays samles med linjeskift. Kommasepareret tekst
+            // (fx et koordinatpar "55.3 N, 10.0 E") bevares som ÉN værdi.
+            const jsonList = tryParseList(value);
+            return jsonList && jsonList.length > 1
+              ? jsonList.map(item => String(item ?? '')).join('\n')
+              : value;
+          })())
     }));
 
     for (const entry of zip.getEntries()) {
