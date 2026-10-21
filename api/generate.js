@@ -100,6 +100,9 @@ function groupCoordinateTokens(values) {
   return grouped;
 }
 
+// Nøgler (kanoniske) der altid er ÉN værdi for hele rapporten.
+const GLOBAL_KEYS = new Set(['insertyear', 'insertbaselineyear', 'baselineyear', 'companyname']);
+
 // Bygger placeholders ud fra "rows" (en liste af objekter).
 //   - ÉN række  -> almindelige værdier (ingen arrays), præcis som hvis de var
 //                  sendt direkte som placeholders-objekt.
@@ -125,11 +128,14 @@ function buildPlaceholdersFromRows(rows) {
     [...keys].map(key => {
       const values = rows.map(row => row?.[key] ?? '');
       const meaningfulValues = values.filter(value => !isEmpty(value));
-      const hasOneRepeatedValue = meaningfulValues.length > 1 && meaningfulValues.every(
+      const allSame = meaningfulValues.every(
         value => String(value).trim() === String(meaningfulValues[0]).trim()
       );
+      const hasOneRepeatedValue = meaningfulValues.length > 1 && allSame;
+      // Årstal og firmanavn gælder for hele rapporten: aldrig én værdi pr. række.
+      const isGlobalValue = meaningfulValues.length >= 1 && allSame && GLOBAL_KEYS.has(canonicalKey(key));
 
-      return [key, hasOneRepeatedValue ? [meaningfulValues[0]] : values];
+      return [key, (hasOneRepeatedValue || isGlobalValue) ? [meaningfulValues[0]] : values];
     })
   );
 }
@@ -309,6 +315,12 @@ function getPlaceholderListValues(value) {
   }
 
   if (typeof value !== 'string' || !value.includes(',')) return null;
+
+  // Danske postnumre ("8000,5000,2100") ligner decimaltal, men er lister.
+  if (/^\d{4}(?:,\s*\d{4})+$/.test(value.trim())) {
+    return value.trim().split(/,\s*/);
+  }
+
   if (looksLikeDecimalNumber(value)) return null;
 
   // Split KUN på et komma der ikke har et mellemrum lige foran sig,
