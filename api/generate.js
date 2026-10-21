@@ -54,16 +54,15 @@ function tryParseList(value) {
 }
 
 // --- TAL-FORMATER (må ALDRIG splittes som lister) ---
-// Genkender:
-//   - Dansk format:   "1234,56", "1.234,56", "-12,3"
-//   - Engelsk format: "1,020.0", "10,004.4", "1,364.4", "2,275.7"
+// Genkender, evt. efterfulgt af en enhed (uden komma i enheden):
+//   - Dansk format:   "1234,56", "1.234,56", "-12,3", "3,4 tCO₂e", "12,5 %"
+//   - Engelsk format: "1,020.0", "10,004.4", "1,364.4 MWh"
+const NUMBER_WITH_COMMA = '-?(?:\\d{1,3}(?:\\.\\d{3})+,\\d+|\\d+,\\d+|\\d{1,3}(?:,\\d{3})+(?:\\.\\d+)?)';
+const OPTIONAL_UNIT = '(?:\\s*[^\\d,\\s][^,]*)?';
+const DECIMAL_NUMBER_REGEX = new RegExp(`^${NUMBER_WITH_COMMA}${OPTIONAL_UNIT}$`);
+
 function looksLikeDecimalNumber(text) {
-  const trimmed = String(text).trim();
-  return (
-    /^-?\d{1,3}(\.\d{3})*,\d+$/.test(trimmed) ||      // 1.234,56
-    /^-?\d+,\d+$/.test(trimmed) ||                    // 1234,56
-    /^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(trimmed)     // 1,234.5 / 10,004.4
-  );
+  return DECIMAL_NUMBER_REGEX.test(String(text).trim());
 }
 
 // Splitter en streng på separator-kommaer, men BESKYTTER kommaer der er
@@ -101,69 +100,12 @@ function groupCoordinateTokens(values) {
   return grouped;
 }
 
-// Én fælles regel for ALLE stier (placeholders-objekt, rows, tabeller):
-// se getPlaceholderListValues.
-function getListValue(value) {
-  const values = getPlaceholderListValues(value);
-  return values ? values.map(item => String(item ?? '').trim()) : null;
-}
-
-function findSharedDelimitedCount(entries) {
-  const counts = new Map();
-  for (const [, values] of entries) {
-    counts.set(values.length, (counts.get(values.length) || 0) + 1);
-  }
-
-  return [...counts.entries()]
-    .filter(([count, columnCount]) => count > 1 && columnCount > 1)
-    .sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? null;
-}
-
-function expandDelimitedObject(object) {
-  if (!object || typeof object !== 'object' || Array.isArray(object)) return null;
-
-  const entries = Object.entries(object);
-  const delimitedEntries = entries
-    .map(([key, value]) => [key, getListValue(value)])
-    .filter(([, values]) => values);
-  const sharedCount = findSharedDelimitedCount(delimitedEntries);
-
-  if (!sharedCount) return null;
-
-  return Array.from({ length: sharedCount }, (_, index) => Object.fromEntries(
-    entries.map(([key, value]) => {
-      const values = getListValue(value);
-      return [key, values?.length === sharedCount ? values[index] : value];
-    })
-  ));
-}
-
-function expandDelimitedRows(rows) {
-  if (!Array.isArray(rows)) return rows;
-
-  return rows.flatMap(row => {
-    if (!row || typeof row !== 'object' || Array.isArray(row)) return [row];
-    return expandDelimitedObject(row) || [row];
-  });
-}
-
-function normalizeRows(rows) {
-  return expandDelimitedRows(tryParseArray(rows));
-}
-
-function normalizeDelimitedPlaceholders(placeholders) {
-  if (!placeholders || typeof placeholders !== 'object') return placeholders;
-  const expandedRows = expandDelimitedObject(placeholders);
-  if (!expandedRows) return placeholders;
-
-  return Object.fromEntries(Object.keys(placeholders).map(key => [
-    key,
-    getListValue(placeholders[key])?.length === expandedRows.length
-      ? expandedRows.map(row => row[key])
-      : placeholders[key]
-  ]));
-}
-
+// Bygger placeholders ud fra "rows" (en liste af objekter).
+//   - ÉN række  -> almindelige værdier (ingen arrays), præcis som hvis de var
+//                  sendt direkte som placeholders-objekt.
+//   - FLERE rækker -> én liste pr. nøgle med en værdi pr. række (bruges til
+//                  at udvide tabelrækker). Er alle værdier ens, samles de til én.
+// Kommaer i tekst bliver ALDRIG splittet her.
 function buildPlaceholdersFromRows(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return null;
 
@@ -174,6 +116,11 @@ function buildPlaceholdersFromRows(rows) {
   }
 
   if (keys.size === 0) return null;
+
+  if (rows.length === 1) {
+    return Object.fromEntries([...keys].map(key => [key, rows[0]?.[key] ?? '']));
+  }
+
   return Object.fromEntries(
     [...keys].map(key => {
       const values = rows.map(row => row?.[key] ?? '');
@@ -274,40 +221,75 @@ function escapeXmlText(value) {
     .replace(/'/g, '&apos;');
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// --- PLACEHOLDER-TOKENS I SLIDE-XML ---
+// Finder {{noget}} i slide-XML, også når PowerPoint har splittet teksten op i
+// flere <a:r>/<a:t>-elementer midt i token'et (der kan ligge tags mellem tegnene).
+const TOKEN_REGEX = /\{(?:<[^>]*>)*\{((?:[^{}<]|<[^>]*>)+?)\}(?:<[^>]*>)*\}/g;
+
+function tokenKey(inner) {
+  return inner.replace(/<[^>]*>/g, '').trim();
 }
 
-function placeholderPattern(key) {
-  const token = `{{${key}}}`;
-  return new RegExp(
-    Array.from(token).map(character => escapeRegExp(character)).join('(?:<[^>]+>)*'),
-    'g'
-  );
+// Kalder resolve(rawKey) for hvert {{token}}. Returnerer resolve en streng
+// (allerede XML-escaped), erstattes hele token'et; returnerer den undefined,
+// efterlades token'et uændret.
+function replaceTokens(xml, resolve) {
+  return xml.replace(TOKEN_REGEX, (full, inner) => {
+    const replacement = resolve(tokenKey(inner));
+    return replacement === undefined ? full : replacement;
+  });
 }
 
-function replacePlaceholderInXml(xml, key, value) {
-  const replacement = escapeXmlText(value);
-  const tokenPattern = placeholderPattern(key);
-  if (tokenPattern.test(xml)) {
-    tokenPattern.lastIndex = 0;
-    return xml.replace(tokenPattern, () => replacement);
+function findTokenKeys(xml) {
+  const keys = [];
+  xml.replace(TOKEN_REGEX, (full, inner) => {
+    keys.push(tokenKey(inner));
+    return full;
+  });
+  return keys;
+}
+
+// Nøgler sammenlignes uden hensyn til store/små bogstaver, mellemrum,
+// understreger og bindestreger. Dermed rammer {{Insert year}} og
+// {{insert_year}} den samme værdi, og {{Company name}} = company_name.
+function canonicalKey(key) {
+  return String(key).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+// Finder den placeholder-nøgle (fra requesten) et token i skabelonen hører til.
+// Præcis match vinder; ellers bruges det tolerante match.
+function createKeyResolver(placeholders) {
+  const exactKeys = new Set(Object.keys(placeholders));
+  const byCanonical = new Map();
+  for (const key of exactKeys) {
+    const canonical = canonicalKey(key);
+    if (canonical && !byCanonical.has(canonical)) byCanonical.set(canonical, key);
   }
 
-  const barePattern = new RegExp(
-    Array.from(String(key)).map(character => escapeRegExp(character)).join('(?:<[^>]+>)*'),
-    'g'
-  );
-  return xml.replace(barePattern, () => replacement);
+  return (rawKey) => {
+    if (exactKeys.has(rawKey)) return rawKey;
+    return byCanonical.get(canonicalKey(rawKey));
+  };
 }
 
-function rowContainsPlaceholder(rowXml, key) {
-  const text = rowXml.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
-  const normalizedKey = String(key).replace(/\s+/g, '');
-  return text.includes(`{{${normalizedKey}}}`) || text.includes(normalizedKey);
+// Gør en placeholder-værdi til tekst. KUN rigtige JSON-arrays samles med
+// linjeskift. Almindelig tekst (også med kommaer) og tal som "3,4 tCO₂e"
+// bevares som ÉN værdi.
+function formatPlaceholderValue(value) {
+  const jsonList = tryParseList(value);
+  if (jsonList) {
+    return groupCoordinateTokens(jsonList.map(item => String(item ?? ''))).join('\n');
+  }
+  return String(value);
+}
+
+function valueToText(value) {
+  return isEmpty(value) ? '' : formatPlaceholderValue(value);
 }
 
 // --- FIND LISTE-VÆRDIER I EN ENKELT PLACEHOLDER-VÆRDI ---
+// BRUGES KUN TIL AT UDVIDE TABELRÆKKER (expandArrayTablesInXml) — aldrig til
+// at splitte almindelig tekst op.
 // Understøtter to former:
 //   1) Et rigtigt JSON-array (fx fra "rows"-baserede payloads).
 //   2) En flad, kommasepareret streng, hvor der skelnes mellem to
@@ -317,8 +299,8 @@ function rowContainsPlaceholder(rowXml, key) {
 //        - "4 , 4" (komma MED mellemrum foran) = hører sammen med
 //          værdien selv (fx for at holde et koordinatpar
 //          "lat , long" samlet som ÉN værdi).
-// Tal med tusindtalsseparator ("10,004.4", "1,020.0") og danske decimaltal
-// ("1.234,56") tolkes IKKE som en liste.
+// Tal med tusindtalsseparator ("10,004.4", "1,020.0"), danske decimaltal
+// ("1.234,56") og tal med enhed ("3,4 tCO₂e") tolkes IKKE som en liste.
 function getPlaceholderListValues(value) {
   const jsonArray = tryParseList(value);
   if (jsonArray && jsonArray.length > 1) {
@@ -363,18 +345,21 @@ function findMatchingArrayGroup(rowArrayEntries) {
 }
 
 // Denne funktion rører KUN rækker, der indeholder et {{placeholder}} fra
-// requesten (via rowContainsPlaceholder). Statisk skabelontekst (fx
-// overskrifter og forklarende sætninger med almindelige kommaer) har ingen
-// {{...}}-token og bliver derfor aldrig splittet op.
+// requesten. Statisk skabelontekst (fx overskrifter og forklarende sætninger
+// med almindelige kommaer) har ingen {{...}}-token og bliver derfor aldrig
+// splittet op. Tabelceller uden tilhørende liste-placeholder røres heller ikke.
 function expandArrayTablesInXml(pptxPath, placeholders) {
-  const arrayPlaceholders = {};
+  const resolveKey = createKeyResolver(placeholders);
+
+  // Nøglerne her er "kanoniske", så de kan slås op uanset stavemåde i skabelonen.
+  const arrayPlaceholders = new Map();
   for (const [key, value] of Object.entries(placeholders)) {
     const values = getPlaceholderListValues(value);
     if (values && values.length > 1) {
-      arrayPlaceholders[key] = { values, rawValue: value };
+      arrayPlaceholders.set(canonicalKey(key), values);
     }
   }
-  if (Object.keys(arrayPlaceholders).length === 0) return;
+  if (arrayPlaceholders.size === 0) return;
 
   try {
     const zip = new AdmZip(pptxPath);
@@ -385,21 +370,20 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
       let changed = false;
 
       xml = xml.replace(/<a:tbl(?:\s[^>]*)?>[\s\S]*?<\/a:tbl>/g, (tableXml) => {
-        let updatedTable = tableXml;
-
-        const placeholderEntries = Object.entries(placeholders).map(([key, value]) => {
-          const info = arrayPlaceholders[key];
-          return [key, info ? info.values : [value]];
-        });
-
-        const rows = updatedTable.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
+        const rows = tableXml.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
 
         let templateRow = null;
         let group = null;
         for (const row of rows) {
-          const rowArrayEntries = Object.entries(arrayPlaceholders)
-            .filter(([key]) => rowContainsPlaceholder(row, key))
-            .map(([key, info]) => [key, info.values, info.rawValue]);
+          const rowCanonicalKeys = [...new Set(
+            findTokenKeys(row)
+              .map(rawKey => resolveKey(rawKey))
+              .filter(key => key !== undefined)
+              .map(key => canonicalKey(key))
+          )];
+          const rowArrayEntries = rowCanonicalKeys
+            .filter(canonical => arrayPlaceholders.has(canonical))
+            .map(canonical => [canonical, arrayPlaceholders.get(canonical)]);
           if (rowArrayEntries.length === 0) continue;
 
           const candidateGroup = findMatchingArrayGroup(rowArrayEntries);
@@ -410,24 +394,30 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
           }
         }
 
-        if (!templateRow || !group) return updatedTable;
+        if (!templateRow || !group) return tableXml;
 
         const expandedRows = Array.from({ length: group.length }, (_, index) => {
-          return placeholderEntries.reduce((row, [key, values]) => {
+          return replaceTokens(templateRow, (rawKey) => {
+            const key = resolveKey(rawKey);
+            if (key === undefined) return undefined;
+
+            const canonical = canonicalKey(key);
+            const values = arrayPlaceholders.has(canonical)
+              ? arrayPlaceholders.get(canonical)
+              : [placeholders[key]];
+
             // Kolonner der ikke selv indgår i den matchende gruppe
             // gentages uændret på hver ny række, fx en adresse- eller
             // label-kolonne der hører til hele gruppen af nye rækker.
-            const value = group.keys.has(key)
+            const value = group.keys.has(canonical)
               ? (values[index] ?? '')
               : (values.length === 1 ? values[0] : (values[index] ?? ''));
-            return replacePlaceholderInXml(row, key, value);
-          }, templateRow);
+            return escapeXmlText(valueToText(value));
+          });
         }).join('');
 
-        updatedTable = updatedTable.replace(templateRow, expandedRows);
         changed = true;
-
-        return updatedTable;
+        return tableXml.replace(templateRow, () => expandedRows);
       });
 
       if (changed) {
@@ -441,41 +431,31 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
   }
 }
 
+// Erstatter alle tilbageværende {{...}} på alle slides (også inde i tabeller
+// og i token'er der er splittet over flere runs) og fjerner ukendte.
 function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
   try {
     const zip = new AdmZip(pptxPath);
-    const replacements = Object.entries(placeholders).map(([key, value]) => ({
-      pattern: placeholderPattern(key),
-      value: isEmpty(value)
-        ? defaultPlaceholderValue(key, value, numericKeys)
-        : escapeXmlText((() => {
-            // Kun rigtige JSON-arrays samles med linjeskift. Kommasepareret tekst
-            // (fx et koordinatpar "55.3 N, 10.0 E") bevares som ÉN værdi.
-            const jsonList = tryParseList(value);
-            return jsonList && jsonList.length > 1
-              ? groupCoordinateTokens(jsonList.map(item => String(item ?? ''))).join('\n')
-              : value;
-          })())
-    }));
+    const resolveKey = createKeyResolver(placeholders);
 
     for (const entry of zip.getEntries()) {
       if (!/^ppt\/slides\/slide\d+\.xml$/.test(entry.entryName)) continue;
 
-      let xml = entry.getData().toString('utf8');
-      let changed = false;
+      const xml = entry.getData().toString('utf8');
 
-      for (const replacement of replacements) {
-        const updatedXml = xml.replace(replacement.pattern, () => replacement.value);
-        if (updatedXml !== xml) changed = true;
-        xml = updatedXml;
-      }
+      const updatedXml = replaceTokens(xml, (rawKey) => {
+        const key = resolveKey(rawKey);
+        if (key === undefined) return ''; // ukendt placeholder -> fjernes
 
-      const withoutUnknownPlaceholders = xml.replace(/\{\{[^}]+\}\}/g, '');
-      if (withoutUnknownPlaceholders !== xml) changed = true;
-      xml = withoutUnknownPlaceholders;
+        const value = placeholders[key];
+        if (isEmpty(value)) {
+          return escapeXmlText(defaultPlaceholderValue(key, value, numericKeys));
+        }
+        return escapeXmlText(formatPlaceholderValue(value));
+      });
 
-      if (changed) {
-        zip.updateFile(entry.entryName, Buffer.from(xml, 'utf8'));
+      if (updatedXml !== xml) {
+        zip.updateFile(entry.entryName, Buffer.from(updatedXml, 'utf8'));
       }
     }
 
@@ -636,12 +616,16 @@ module.exports = async function handler(req, res) {
     }
 
     const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
-    const normalizedRows = normalizeRows(rows);
+
+    // Kommaer i tekst splittes IKKE her. Kun tabelrækker udvides (se
+    // expandArrayTablesInXml), og kun når mindst 2 kolonner i samme række
+    // har samme antal kommaseparerede værdier.
+    const normalizedRows = tryParseArray(rows);
     const parsedPlaceholderValue = parseJsonValue(requestPlaceholders);
-    const placeholderRows = normalizeRows(parsedPlaceholderValue);
+    const placeholderRows = tryParseArray(parsedPlaceholderValue);
     const placeholders = buildPlaceholdersFromRows(normalizedRows)
       || buildPlaceholdersFromRows(placeholderRows)
-      || normalizeDelimitedPlaceholders(tryParseObject(parsedPlaceholderValue));
+      || tryParseObject(parsedPlaceholderValue);
 
     if (!template_url || !placeholders) {
       return res.status(400).json({ error: 'Manglende template_url eller placeholders i JSON.' });
@@ -793,7 +777,7 @@ module.exports = async function handler(req, res) {
     expandArrayTablesInXml(outputPath, placeholders);
 
     // --- SKRIDT 2.5: XML-NIVEAU CLEANUP ---
-    // Fjerner alle tilbageværende {{...}} og "null"-værdier direkte i PPTX-XML
+    // Erstatter alle {{...}} (inkl. tabeller) og fjerner ukendte/tomme værdier direkte i PPTX-XML
     cleanupResidualPlaceholders(outputPath, placeholders, numericKeys);
 
     // --- SKRIDT 2.6: SLET SLIDES OG TABELLER ---
