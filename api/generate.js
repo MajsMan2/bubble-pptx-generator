@@ -153,6 +153,7 @@ function defaultPlaceholderValue(key, value, numericKeys) {
 
 function isEmpty(value) {
   if (value === null || value === undefined) return true;
+  if (Array.isArray(value)) return value.every(isEmpty);
   const str = String(value).trim();
   if (str === '') return true;
   if (str.toLowerCase() === 'null') return true;
@@ -284,7 +285,8 @@ function createKeyResolver(placeholders) {
 function formatPlaceholderValue(value) {
   const jsonList = tryParseList(value);
   if (jsonList) {
-    return groupCoordinateTokens(jsonList.map(item => String(item ?? ''))).join('\n');
+    const items = jsonList.map(item => String(item ?? '')).filter(item => item.trim() !== '');
+    return groupCoordinateTokens(items).join('\n');
   }
   return String(value);
 }
@@ -325,7 +327,10 @@ function getPlaceholderListValues(value) {
 
   // Split KUN på et komma der ikke har et mellemrum lige foran sig,
   // og som ikke er en tusindtalsseparator (beskyttes i splitOnSeparators).
-  const values = groupCoordinateTokens(splitOnSeparators(value, /(?<! ),\s*/));
+  const rawValues = splitOnSeparators(value, /(?<! ),\s*/);
+  // Et afsluttende komma ("a, b, c,") giver et tomt sidste element — det ignoreres.
+  while (rawValues.length > 0 && rawValues[rawValues.length - 1] === '') rawValues.pop();
+  const values = groupCoordinateTokens(rawValues);
   if (values.length < 2 || values.some(item => item === '')) return null;
   return values;
 }
@@ -356,11 +361,185 @@ function findMatchingArrayGroup(rowArrayEntries) {
   return { length: sharedLength, keys };
 }
 
+// Slidens indhold må ikke ligge nede i footer-området (sidetal, firmanavn).
+const CONTENT_LIMIT_Y = 7150000;
+// Mindste luft mellem en udvidet tabel og det der ligger lige under den.
+const MIN_GAP_EMU = 200000;
+
+function sumRowHeights(xml) {
+  let total = 0;
+  for (const match of xml.matchAll(/<a:tr\s[^>]*?\bh="(\d+)"/g)) total += Number(match[1]);
+  return total;
+}
+
+// Finder alle top-level figurer på en slide med deres top-position og højde.
+function listShapes(xml) {
+  const shapes = [];
+  const regex = /<p:(sp|graphicFrame|pic|cxnSp)>[\s\S]*?<\/p:\1>/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    const block = match[0];
+    const off = block.match(/<a:off x="(-?\d+)" y="(-?\d+)"\s*\/>/);
+    if (!off) continue;
+
+    let height = 0;
+    if (block.includes('<a:tbl')) {
+      height = sumRowHeights(block);
+    } else {
+      const ext = block.match(/<a:ext cx="(\d+)" cy="(\d+)"\s*\/>/);
+      height = ext ? Number(ext[2]) : 0;
+    }
+    shapes.push({ start: match.index, end: match.index + block.length, y: Number(off[2]), height });
+  }
+  return shapes;
+}
+
+// Når en tabel bliver højere, flyttes det der ligger UNDER den ned, så intet
+// overlapper. Først bruges den luft der allerede var under tabellen; kun resten
+// skubbes. Footeren (sidetal/firmanavn) flyttes aldrig.
+function pushShapesDown(xml, skip, tableTop, originalBottom, added, diagnostics, slideLabel) {
+  if (added <= 0) return xml;
+
+  if (xml.includes('<p:grpSp>')) {
+    diagnostics.warnings.push(`${slideLabel}: tabellen blev ${added} EMU højere, men sliden har grupperede figurer, så intet blev flyttet ned.`);
+    return xml;
+  }
+
+  const shapes = listShapes(xml).filter(shape =>
+    !(shape.start >= skip.start && shape.end <= skip.end) && shape.y < CONTENT_LIMIT_Y
+  );
+  const below = shapes.filter(shape => shape.y >= originalBottom - 1000);
+
+  let shift = 0;
+  if (below.length > 0) {
+    const nearestGap = Math.min(...below.map(shape => shape.y)) - originalBottom;
+    shift = Math.max(0, added - Math.max(0, nearestGap - MIN_GAP_EMU));
+  }
+
+  if (shift > 0) {
+    for (const shape of [...below].sort((a, b) => b.start - a.start)) {
+      const block = xml.slice(shape.start, shape.end).replace(
+        /(<a:off x="-?\d+" y=")(-?\d+)(")/,
+        (full, before, y, after) => `${before}${Number(y) + shift}${after}`
+      );
+      xml = xml.slice(0, shape.start) + block + xml.slice(shape.end);
+    }
+  }
+
+  const lowestBottom = Math.max(
+    originalBottom + added,
+    ...below.map(shape => shape.y + shift + shape.height)
+  );
+  if (lowestBottom > CONTENT_LIMIT_Y) {
+    diagnostics.warnings.push(
+      `${slideLabel}: for mange rækker til sliden — indholdet slutter ${lowestBottom - CONTENT_LIMIT_Y} EMU (ca. ${((lowestBottom - CONTENT_LIMIT_Y) / 360000).toFixed(1)} cm) under den sikre nederste kant.`
+    );
+  }
+  return xml;
+}
+
+// Udvider den første række i EN tabel (grafik-ramme) hvis mindst 2 kolonner i
+// rækken har liste-værdier med samme antal. Returnerer null hvis intet skal ske.
+function expandTableFrame(frameXml, ctx) {
+  const tableMatch = frameXml.match(/<a:tbl(?:\s[^>]*)?>[\s\S]*?<\/a:tbl>/);
+  if (!tableMatch) return null;
+  const tableXml = tableMatch[0];
+  const rows = tableXml.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
+
+  let templateRow = null;
+  let group = null;
+  for (const row of rows) {
+    const rowCanonicalKeys = [...new Set(
+      findTokenKeys(row)
+        .map(rawKey => ctx.resolveKey(rawKey))
+        .filter(key => key !== undefined)
+        .map(key => canonicalKey(key))
+    )];
+    const rowArrayEntries = rowCanonicalKeys
+      .filter(canonical => ctx.arrayPlaceholders.has(canonical))
+      .map(canonical => [canonical, ctx.arrayPlaceholders.get(canonical)]);
+    if (rowArrayEntries.length === 0) continue;
+
+    const candidateGroup = findMatchingArrayGroup(rowArrayEntries);
+    if (candidateGroup) {
+      templateRow = row;
+      group = candidateGroup;
+      break;
+    }
+  }
+
+  if (!templateRow || !group) return null;
+
+  const expandedRows = Array.from({ length: group.length }, (_, index) => {
+    return replaceTokens(templateRow, (rawKey) => {
+      const key = ctx.resolveKey(rawKey);
+      if (key === undefined) return undefined;
+      ctx.diagnostics.usedKeys.add(key);
+
+      const canonical = canonicalKey(key);
+      const values = ctx.arrayPlaceholders.has(canonical)
+        ? ctx.arrayPlaceholders.get(canonical)
+        : [ctx.placeholders[key]];
+
+      // Kolonner der ikke selv indgår i den matchende gruppe
+      // gentages uændret på hver ny række, fx en adresse- eller
+      // label-kolonne der hører til hele gruppen af nye rækker.
+      const value = group.keys.has(canonical)
+        ? (values[index] ?? '')
+        : (values.length === 1 ? values[0] : (values[index] ?? ''));
+      return escapeXmlText(valueToText(value));
+    });
+  }).join('');
+
+  const newTableXml = tableXml.replace(templateRow, () => expandedRows);
+  return {
+    xml: frameXml.replace(tableXml, () => newTableXml),
+    oldHeight: sumRowHeights(tableXml),
+    newHeight: sumRowHeights(newTableXml)
+  };
+}
+
+// Udvider alle tabeller på EN slide, oppefra og ned, og flytter det under
+// hver udvidet tabel ned efter behov.
+function expandTablesInSlide(slideXml, ctx, slideLabel) {
+  let xml = slideXml;
+  let changed = false;
+
+  for (let guard = 0; guard < 25; guard++) {
+    const frames = listShapes(xml)
+      .filter(shape => xml.slice(shape.start, shape.end).includes('<a:tbl'))
+      .sort((a, b) => a.y - b.y);
+
+    let progressed = false;
+    for (const frame of frames) {
+      const result = expandTableFrame(xml.slice(frame.start, frame.end), ctx);
+      if (!result) continue;
+
+      xml = xml.slice(0, frame.start) + result.xml + xml.slice(frame.end);
+      xml = pushShapesDown(
+        xml,
+        { start: frame.start, end: frame.start + result.xml.length },
+        frame.y,
+        frame.y + result.oldHeight,
+        result.newHeight - result.oldHeight,
+        ctx.diagnostics,
+        slideLabel
+      );
+      changed = true;
+      progressed = true;
+      break; // start forfra, så positionerne er friske
+    }
+    if (!progressed) break;
+  }
+
+  return { xml, changed };
+}
+
 // Denne funktion rører KUN rækker, der indeholder et {{placeholder}} fra
 // requesten. Statisk skabelontekst (fx overskrifter og forklarende sætninger
 // med almindelige kommaer) har ingen {{...}}-token og bliver derfor aldrig
 // splittet op. Tabelceller uden tilhørende liste-placeholder røres heller ikke.
-function expandArrayTablesInXml(pptxPath, placeholders) {
+function expandArrayTablesInXml(pptxPath, placeholders, diagnostics) {
   const resolveKey = createKeyResolver(placeholders);
 
   // Nøglerne her er "kanoniske", så de kan slås op uanset stavemåde i skabelonen.
@@ -373,67 +552,18 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
   }
   if (arrayPlaceholders.size === 0) return;
 
+  const ctx = { resolveKey, arrayPlaceholders, placeholders, diagnostics };
+
   try {
     const zip = new AdmZip(pptxPath);
     for (const entry of zip.getEntries()) {
-      if (!/^ppt\/slides\/slide\d+\.xml$/.test(entry.entryName)) continue;
+      const slideMatch = entry.entryName.match(/^ppt\/slides\/slide(\d+)\.xml$/);
+      if (!slideMatch) continue;
 
-      let xml = entry.getData().toString('utf8');
-      let changed = false;
-
-      xml = xml.replace(/<a:tbl(?:\s[^>]*)?>[\s\S]*?<\/a:tbl>/g, (tableXml) => {
-        const rows = tableXml.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) || [];
-
-        let templateRow = null;
-        let group = null;
-        for (const row of rows) {
-          const rowCanonicalKeys = [...new Set(
-            findTokenKeys(row)
-              .map(rawKey => resolveKey(rawKey))
-              .filter(key => key !== undefined)
-              .map(key => canonicalKey(key))
-          )];
-          const rowArrayEntries = rowCanonicalKeys
-            .filter(canonical => arrayPlaceholders.has(canonical))
-            .map(canonical => [canonical, arrayPlaceholders.get(canonical)]);
-          if (rowArrayEntries.length === 0) continue;
-
-          const candidateGroup = findMatchingArrayGroup(rowArrayEntries);
-          if (candidateGroup) {
-            templateRow = row;
-            group = candidateGroup;
-            break;
-          }
-        }
-
-        if (!templateRow || !group) return tableXml;
-
-        const expandedRows = Array.from({ length: group.length }, (_, index) => {
-          return replaceTokens(templateRow, (rawKey) => {
-            const key = resolveKey(rawKey);
-            if (key === undefined) return undefined;
-
-            const canonical = canonicalKey(key);
-            const values = arrayPlaceholders.has(canonical)
-              ? arrayPlaceholders.get(canonical)
-              : [placeholders[key]];
-
-            // Kolonner der ikke selv indgår i den matchende gruppe
-            // gentages uændret på hver ny række, fx en adresse- eller
-            // label-kolonne der hører til hele gruppen af nye rækker.
-            const value = group.keys.has(canonical)
-              ? (values[index] ?? '')
-              : (values.length === 1 ? values[0] : (values[index] ?? ''));
-            return escapeXmlText(valueToText(value));
-          });
-        }).join('');
-
-        changed = true;
-        return tableXml.replace(templateRow, () => expandedRows);
-      });
-
-      if (changed) {
-        zip.updateFile(entry.entryName, Buffer.from(xml, 'utf8'));
+      const xml = entry.getData().toString('utf8');
+      const result = expandTablesInSlide(xml, ctx, `Slide ${slideMatch[1]}`);
+      if (result.changed) {
+        zip.updateFile(entry.entryName, Buffer.from(result.xml, 'utf8'));
       }
     }
 
@@ -445,7 +575,8 @@ function expandArrayTablesInXml(pptxPath, placeholders) {
 
 // Erstatter alle tilbageværende {{...}} på alle slides (også inde i tabeller
 // og i token'er der er splittet over flere runs) og fjerner ukendte.
-function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
+// Noterer i diagnostics hvilke nøgler der blev brugt, var tomme eller manglede.
+function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys, diagnostics) {
   try {
     const zip = new AdmZip(pptxPath);
     const resolveKey = createKeyResolver(placeholders);
@@ -457,13 +588,18 @@ function cleanupResidualPlaceholders(pptxPath, placeholders, numericKeys) {
 
       const updatedXml = replaceTokens(xml, (rawKey) => {
         const key = resolveKey(rawKey);
-        if (key === undefined) return ''; // ukendt placeholder -> fjernes
-
-        const value = placeholders[key];
-        if (isEmpty(value)) {
-          return escapeXmlText(defaultPlaceholderValue(key, value, numericKeys));
+        if (key === undefined) {
+          diagnostics.unmatchedTokens.add(rawKey); // ingen værdi sendt -> fjernes
+          return '';
         }
-        return escapeXmlText(formatPlaceholderValue(value));
+        diagnostics.usedKeys.add(key);
+
+        const text = valueToText(placeholders[key]);
+        if (text.trim() === '') {
+          diagnostics.emptyKeys.add(key);
+          return escapeXmlText(defaultPlaceholderValue(key, '', numericKeys));
+        }
+        return escapeXmlText(text);
       });
 
       if (updatedXml !== xml) {
@@ -493,7 +629,8 @@ function deleteSlides(pptxPath, slidesToDelete) {
     let presXml = presEntry.getData().toString('utf8');
 
     // Find alle slide-id'er i rækkefølge: <p:sldId id="..." r:id="rId..."/>
-    const sldIdRegex = /<p:sldId[^/]* r:id="(rId\d+)"[^/]*\/>/g;
+    // \s efter "sldId" sikrer at <p:sldIdLst> (listens start-tag) ikke matches sammen med første slide.
+    const sldIdRegex = /<p:sldId\s[^>]*?r:id="(rId\d+)"[^>]*\/>/g;
     const slideRefs = [];
     let m;
     while ((m = sldIdRegex.exec(presXml)) !== null) {
@@ -516,6 +653,31 @@ function deleteSlides(pptxPath, slidesToDelete) {
       const target = relMatch[1]; // fx "slides/slide3.xml"
       const slidePath = `ppt/${target}`;
       const slideRelsPath = `ppt/slides/_rels/${path.basename(target)}.rels`;
+
+      // Fjern slidens notesside (taleroller), ellers ligger den som "forladt" fil i pakken
+      // og PowerPoint kan melde filen som beskadiget.
+      const slideRelsEntry = zip.getEntry(slideRelsPath);
+      if (slideRelsEntry) {
+        const slideRelsXml = slideRelsEntry.getData().toString('utf8');
+        for (const rel of slideRelsXml.match(/<Relationship\b[^>]*>/g) || []) {
+          if (!/Type="[^"]*\/notesSlide"/.test(rel)) continue;
+          const notesTarget = rel.match(/Target="([^"]+)"/);
+          if (!notesTarget) continue;
+
+          const notesPath = path.posix.normalize(`ppt/slides/${notesTarget[1]}`);
+          zip.deleteFile(notesPath);
+          zip.deleteFile(`${path.posix.dirname(notesPath)}/_rels/${path.posix.basename(notesPath)}.rels`);
+
+          const notesCtEntry = zip.getEntry('[Content_Types].xml');
+          if (notesCtEntry) {
+            const notesCtXml = notesCtEntry.getData().toString('utf8').replace(
+              new RegExp(`<Override[^>]*PartName="/${notesPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*/>`),
+              ''
+            );
+            zip.updateFile('[Content_Types].xml', Buffer.from(notesCtXml, 'utf8'));
+          }
+        }
+      }
 
       // Fjern slide-filen og dens .rels
       zip.deleteFile(slidePath);
@@ -627,7 +789,7 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion } = body;
+    const { template_url, placeholders: requestPlaceholders, rows, company_unique_id, company_name, delete_slides, delete_tables, enable_table_deletion, debug } = body;
 
     // Kommaer i tekst splittes IKKE her. Kun tabelrækker udvides (se
     // expandArrayTablesInXml), og kun når mindst 2 kolonner i samme række
@@ -786,11 +948,33 @@ module.exports = async function handler(req, res) {
       fs.copyFileSync(templatePath, outputPath);
     }
 
-    expandArrayTablesInXml(outputPath, placeholders);
+    // Samler hvad der skete med hver placeholder, så en tom celle kan forklares.
+    const diagnostics = {
+      usedKeys: new Set(),
+      unmatchedTokens: new Set(),
+      emptyKeys: new Set(),
+      warnings: []
+    };
+
+    expandArrayTablesInXml(outputPath, placeholders, diagnostics);
 
     // --- SKRIDT 2.5: XML-NIVEAU CLEANUP ---
     // Erstatter alle {{...}} (inkl. tabeller) og fjerner ukendte/tomme værdier direkte i PPTX-XML
-    cleanupResidualPlaceholders(outputPath, placeholders, numericKeys);
+    cleanupResidualPlaceholders(outputPath, placeholders, numericKeys, diagnostics);
+
+    const diagnosticsReport = {
+      emptyValues: [...diagnostics.emptyKeys],
+      unusedKeys: Object.keys(placeholders).filter(key => !diagnostics.usedKeys.has(key)),
+      unmatchedTokens: [...diagnostics.unmatchedTokens],
+      warnings: diagnostics.warnings
+    };
+    // Kort log-linje til Vercel (hele listen over ikke-sendte felter kommer kun med debug: true).
+    console.log('[pptx-diagnostics]', JSON.stringify({
+      emptyValues: diagnosticsReport.emptyValues,
+      unusedKeys: diagnosticsReport.unusedKeys,
+      templateTokensWithoutValue: diagnosticsReport.unmatchedTokens.length,
+      warnings: diagnosticsReport.warnings
+    }));
 
     // --- SKRIDT 2.6: SLET SLIDES OG TABELLER ---
     // delete_slides: [1, 3, 5]  — 1-baserede slide-numre
@@ -954,7 +1138,9 @@ module.exports = async function handler(req, res) {
       fileName: path.basename(outputPath),
       fileUrl: editorUrl,
       shareLink: shareToken,
-      debugInfo: linkDebugInfo
+      debugInfo: linkDebugInfo,
+      warnings: diagnostics.warnings,
+      ...(debug ? { diagnostics: diagnosticsReport } : {})
     });
 
   } catch (globalError) {
