@@ -162,6 +162,10 @@ function isEmpty(value) {
   return false;
 }
 
+function isXMarker(value) {
+  return /^X,?$/i.test(valueToText(value).trim());
+}
+
 function buildReplaceParams(placeholders) {
   const params = [];
   for (const [key, value] of Object.entries(placeholders)) {
@@ -484,9 +488,12 @@ function expandTableFrame(frameXml, ctx) {
       // Kolonner der ikke selv indgår i den matchende gruppe
       // gentages uændret på hver ny række, fx en adresse- eller
       // label-kolonne der hører til hele gruppen af nye rækker.
+      // En enkelt X-markør gælder kun for den første række.
       const value = group.keys.has(canonical)
         ? (values[index] ?? '')
-        : (values.length === 1 ? values[0] : (values[index] ?? ''));
+        : (values.length === 1
+          ? (isXMarker(values[0]) ? (index === 0 ? values[0] : '') : values[0])
+          : (values[index] ?? ''));
       return escapeXmlText(valueToText(value));
     });
   }).join('');
