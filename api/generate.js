@@ -100,6 +100,34 @@ function groupCoordinateTokens(values) {
   return grouped;
 }
 
+function isGeolocationKey(key) {
+  return /(?:geolocation|geolokation|coordinate|koordinat)/.test(canonicalKey(key));
+}
+
+function groupDecimalCoordinateTokens(values) {
+  if (values.length < 2 || values.length % 2 !== 0) return values;
+
+  const coordinates = values.map(value => {
+    const text = String(value).trim();
+    if (!/^-?\d+(?:\.\d+)?$/.test(text)) return null;
+    const number = Number(text);
+    return Number.isFinite(number) ? number : null;
+  });
+  if (coordinates.some(value => value === null)) return values;
+
+  for (let index = 0; index < coordinates.length; index += 2) {
+    const latitude = coordinates[index];
+    const longitude = coordinates[index + 1];
+    if (Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return values;
+  }
+
+  const grouped = [];
+  for (let index = 0; index < values.length; index += 2) {
+    grouped.push(`${String(values[index]).trim()}, ${String(values[index + 1]).trim()}`);
+  }
+  return grouped;
+}
+
 // Nøgler (kanoniske) der altid er ÉN værdi for hele rapporten.
 const GLOBAL_KEYS = new Set(['insertyear', 'insertbaselineyear', 'baselineyear', 'companyname']);
 
@@ -313,10 +341,13 @@ function valueToText(value) {
 //          "lat , long" samlet som ÉN værdi).
 // Tal med tusindtalsseparator ("10,004.4", "1,020.0"), danske decimaltal
 // ("1.234,56") og tal med enhed ("3,4 tCO₂e") tolkes IKKE som en liste.
-function getPlaceholderListValues(value) {
+function getPlaceholderListValues(value, key) {
   const jsonArray = tryParseList(value);
   if (jsonArray && jsonArray.length > 1) {
-    const items = groupCoordinateTokens(jsonArray.map(item => String(item ?? '')));
+    const parsedItems = jsonArray.map(item => String(item ?? ''));
+    const items = isGeolocationKey(key)
+      ? groupDecimalCoordinateTokens(groupCoordinateTokens(parsedItems))
+      : groupCoordinateTokens(parsedItems);
     return items.length > 1 ? items : null;
   }
 
@@ -334,7 +365,9 @@ function getPlaceholderListValues(value) {
   const rawValues = splitOnSeparators(value, /(?<! ),\s*/);
   // Et afsluttende komma ("a, b, c,") giver et tomt sidste element — det ignoreres.
   while (rawValues.length > 0 && rawValues[rawValues.length - 1] === '') rawValues.pop();
-  const values = groupCoordinateTokens(rawValues);
+  const values = isGeolocationKey(key)
+    ? groupDecimalCoordinateTokens(groupCoordinateTokens(rawValues))
+    : groupCoordinateTokens(rawValues);
   if (values.length < 2 || values.some(item => item === '')) return null;
   return values;
 }
@@ -492,7 +525,7 @@ function expandTableFrame(frameXml, ctx) {
       const value = group.keys.has(canonical)
         ? (values[index] ?? '')
         : (values.length === 1
-          ? (isXMarker(values[0]) ? (index === 0 ? values[0] : '') : values[0])
+          ? (isXMarker(values[0]) ? (index === 0 ? String(values[0]).trim().replace(/,$/, '') : '') : values[0])
           : (values[index] ?? ''));
       return escapeXmlText(valueToText(value));
     });
@@ -552,7 +585,7 @@ function expandArrayTablesInXml(pptxPath, placeholders, diagnostics) {
   // Nøglerne her er "kanoniske", så de kan slås op uanset stavemåde i skabelonen.
   const arrayPlaceholders = new Map();
   for (const [key, value] of Object.entries(placeholders)) {
-    const values = getPlaceholderListValues(value);
+    const values = getPlaceholderListValues(value, key);
     if (values && values.length > 1) {
       arrayPlaceholders.set(canonicalKey(key), values);
     }
@@ -835,7 +868,7 @@ module.exports = async function handler(req, res) {
     const numericKeys = new Set();
     for (const [key, value] of Object.entries(placeholders)) {
       if (isEmpty(value)) continue;
-      const arr = getPlaceholderListValues(value);
+      const arr = getPlaceholderListValues(value, key);
       if (arr && arr.length > 1) {
         arrayPlaceholders[key] = arr;
         if (arr.some(isNumericValue)) numericKeys.add(key);
